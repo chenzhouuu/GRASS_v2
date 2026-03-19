@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.env
+*.sqlite
+*.db
+node_modules/
+.next/
+data/langgraph_checkpoints.sqlite
+data/sessions.db
+.claude/logs/
+github/
+frontend/.next/
+frontend/node_modules/
+*.dump
+.DS_Store
