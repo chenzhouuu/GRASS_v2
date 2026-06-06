@@ -1,0 +1,26 @@
+agents:
+  supervisor_agent:
+    provider: openai
+    model_config:
+      model: gpt-5.4-mini
+      temperature: 0
+  cypher_agent:
+    provider: openai
+    model_config:
+      model: gpt-5.4-mini
+      temperature: 0
+  analytics_agent:
+    provider: openai
+    model_config:
+      model: gpt-5.4-mini
+      temperature: 0
+  optimization_agent:
+    provider: openai
+    model_config:
+      model: gpt-5.4-mini
+      temperature: 0
+  report_agent:
+    provider: openai
+    model_config:
+      model: gpt-5.4-mini
+      temperature: 0

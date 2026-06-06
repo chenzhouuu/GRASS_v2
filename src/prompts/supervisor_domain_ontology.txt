@@ -1,0 +1,60 @@
+## Supply Chain Domain Model
+
+### Network Structure
+The knowledge graph represents a Pennsylvania dairy supply chain network with the
+following operational flow:
+
+  DairyFarm -> (MEMBER_OF) -> Cooperative -> (SUPPLIES_RAW_MILK) -> Processor
+  -> (PRODUCES) -> DairyProduct
+  Processor -> (SHIPS_TO) -> DistributionCenter -> (DELIVERS_TO) -> Retailer
+  Retailer -> (DEMANDS) -> DairyProduct
+
+Additional flows:
+  DairyFarm -> (DIRECT_SELLS) -> Retailer  [farm-to-table bypass]
+  Cooperative -> (STORES_AT) -> StorageFacility  [cold chain]
+  Processor -> (USES_STORAGE) -> StorageFacility  [cold chain]
+  DairyProduct -> (REQUIRES_INPUT) -> DairyProduct  [input dependencies, e.g. whey from cheese]
+
+### FMMO Pricing (Federal Milk Marketing Orders)
+Pennsylvania dairy is regulated under two FMMO regions:
+- **Northeast (Order 1)**: Class I differential $5.10/cwt, blend price $22.40/cwt
+- **Mideast (Order 33)**: Class I differential $3.80/cwt, blend price $21.20/cwt
+
+Milk is classified into four pricing classes:
+- **Class I** (fluid milk): Highest regulated price. Products: Whole Milk, 2% Reduced Fat, Skim, Chocolate Milk, Organic Whole, Half and Half, Heavy Cream, Evaporated Milk.
+- **Class II** (soft products): Yogurt, Ice Cream, Frozen Yogurt, Cream Cheese, Sour Cream.
+- **Class III** (hard cheese): Cheddar, Mozzarella, Swiss, Provolone, Colby Jack, Cottage Cheese, Whey Protein Concentrate.
+- **Class IV** (butter/powder): Butter, Salted Butter, Nonfat Dry Milk, Whole Milk Powder.
+
+The blend price is the weighted average a farmer receives, calculated from the
+utilization mix across all four classes in their FMMO region.
+
+### Conversion Ratios
+The `conversion_ratio` property on DairyProduct indicates pounds of raw milk needed
+to produce one pound of finished product. Examples:
+- Fluid milk: ~1.0 (minimal conversion)
+- Cheese: 10-11 lbs milk per lb cheese
+- Butter: 21.2 lbs milk per lb butter
+- Whey Protein Concentrate: 15 lbs milk per lb
+
+This ratio is critical for optimization problems (raw milk allocation, production
+planning) and cost analysis.
+
+### Risk Model
+RiskEvent nodes model supply chain disruptions with probability, severity (1-5),
+season, and affected_radius_miles. The AFFECTS relationship connects risks to
+DairyFarm, Processor, or Retailer with impact_pct and recovery_time_days.
+High-severity events: contamination (4.7), disease outbreak (4.3).
+High-probability events: equipment failure (0.20), winter storm (0.15).
+
+### Spatial Structure
+All supply chain entities have lat/lon coordinates and are linked to one of 67
+Pennsylvania counties via LOCATED_IN. Counties link to FMMO regions via REGULATED_BY.
+The BORDERS relationship connects adjacent counties (for spatial analysis like
+disruption propagation, service area computation).
+
+### Cooperative Structure
+12 cooperatives aggregate raw milk from dairy farms. Each cooperative has a
+service_region (list of counties), member_count, total_pooled_volume_lbs, and
+hauling_fleet_size. Largest: Dairy Farmers of America, Land O'Lakes.
+Some operate under both FMMO orders.

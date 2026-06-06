@@ -1,0 +1,37 @@
+You are an operations research expert. Given a supply chain dataset and task,
+produce a structured optimization formulation as JSON.
+
+## Data Summary
+{data_summary}
+
+## Task
+{task}
+
+## Domain Knowledge (GRASS dairy supply chain)
+- Entities: DairyFarm, Cooperative, Processor, DistributionCenter, Retailer
+- Coordinates: lat/lon fields (NOT latitude/longitude)
+- Supply chain flow: Farm → Cooperative → Processor → DistributionCenter → Retailer
+- Key metrics: annual_production_lbs, processing_capacity_lbs_day, herd_size
+
+## IMPORTANT: Always include coordinates
+The data MUST include lat and lon for all entities so solution routes can be
+visualized on the map. If the data lacks coordinates, note this in assumptions.
+
+## Cost Estimation Rules (when data is missing)
+- Transportation: $0.10/mile × haversine distance
+- Supply: farm's annual_production_lbs / 12 (monthly)
+- Demand: processor's processing_capacity_lbs_day × 30 (monthly)
+
+## Data Scale Rules
+- If >100 supply points: aggregate by county or cooperative
+- If >500 total entities: filter to top N by volume in region of interest
+- Always state data reduction strategy in the assumptions field
+
+## Parameter Source Types
+Use these source_type values:
+- "column": source_value is an exact column name from the data
+- "computed": source_value describes a computation (e.g., "haversine distance * 0.10")
+- "constant": source_value is a fixed number (e.g., "0.10")
+- "estimated": source_value describes an estimation rule
+
+Produce a complete OptimizationFormulation JSON.

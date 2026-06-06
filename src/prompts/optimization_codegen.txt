@@ -1,0 +1,305 @@
+You are a Python optimization engineer. Given this structured formulation,
+generate PuLP code to solve it.
+
+## Formulation
+{formulation_json}
+
+## Data Preview (first 3 rows)
+{data_preview}
+
+## WORKED EXAMPLE: Transportation Problem
+
+Given a transportation formulation, the correct PuLP code pattern is:
+
+```python
+import json, math
+import pulp
+import pandas as pd
+import numpy as np
+import shutil
+import plotly.graph_objects as go
+import plotly.io as pio
+
+df = pd.read_json("data/cypher_results.json")
+
+# Build supply points from farm columns (deduplicate joined rows)
+farms = df[["farm_name", "farm_lat", "farm_lon", "farm_prod"]].drop_duplicates("farm_name").reset_index(drop=True)
+farms.columns = ["name", "lat", "lon", "annual_production_lbs"]
+
+# Build demand points from processor columns
+procs = df[["proc_name", "proc_lat", "proc_lon", "proc_cap"]].drop_duplicates("proc_name").reset_index(drop=True)
+procs.columns = ["name", "lat", "lon", "processing_capacity_lbs_day"]
+
+# Optional: aggregate farms by cooperative if too many supply points
+# agg = df.groupby("coop_name").agg(
+#     lat=("farm_lat","mean"), lon=("farm_lon","mean"),
+#     supply=("farm_prod","sum")).reset_index()
+# farms = agg.rename(columns={"coop_name": "name", "supply": "annual_production_lbs"})
+
+I, J = len(farms), len(procs)
+
+def haversine(lat1, lon1, lat2, lon2):
+    R = 3959  # miles
+    dlat, dlon = math.radians(lat2-lat1), math.radians(lon2-lon1)
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1))*math.cos(math.radians(lat2))*math.sin(dlon/2)**2
+    return R * 2 * math.asin(math.sqrt(a))
+
+supply = {i: farms.loc[i, "annual_production_lbs"] / 12 for i in range(I)}
+demand = {j: procs.loc[j, "processing_capacity_lbs_day"] * 30 for j in range(J)}
+cost = {(i,j): 0.10 * haversine(farms.loc[i,"lat"], farms.loc[i,"lon"],
+                                  procs.loc[j,"lat"], procs.loc[j,"lon"])
+        for i in range(I) for j in range(J)}
+
+prob = pulp.LpProblem("Transportation", pulp.LpMinimize)
+x = pulp.LpVariable.dicts("x", cost.keys(), lowBound=0)
+prob += pulp.lpSum(cost[i,j] * x[i,j] for i,j in cost)
+for i in range(I):
+    prob += pulp.lpSum(x[i,j] for j in range(J)) <= supply[i], f"supply_{i}"
+for j in range(J):
+    prob += pulp.lpSum(x[i,j] for i in range(I)) >= demand[j], f"demand_{j}"
+
+solver = pulp.GUROBI_CMD(msg=0) if shutil.which("gurobi_cl") else pulp.PULP_CBC_CMD(msg=0)
+prob.solve(solver)
+
+routes = []
+for (i,j), var in x.items():
+    if var.varValue and var.varValue > 0.01:
+        routes.append({
+            "from": farms.loc[i, "name"], "to": procs.loc[j, "name"],
+            "volume": round(var.varValue, 1),
+            "cost": round(cost[i,j] * var.varValue, 2),
+            "origin_lat": float(farms.loc[i, "lat"]),
+            "origin_lon": float(farms.loc[i, "lon"]),
+            "dest_lat": float(procs.loc[j, "lat"]),
+            "dest_lon": float(procs.loc[j, "lon"]),
+        })
+routes.sort(key=lambda r: r["volume"], reverse=True)
+
+# Sensitivity (LP only — MILP constraints don't have dual values)
+sensitivity = []
+is_lp = all(v.cat == "Continuous" for v in prob.variables())
+if is_lp:
+    for name, c in prob.constraints.items():
+        if c.pi is not None and abs(c.pi) > 0.001:
+            sensitivity.append({"constraint": name, "shadow_price": round(c.pi, 4), "slack": round(c.slack, 2)})
+else:
+    print("Note: Sensitivity analysis not available for MILP problems.")
+
+print(f"Status: {pulp.LpStatus[prob.status]}")
+print(f"Objective: ${pulp.value(prob.objective):,.2f}")
+for r in routes[:10]:
+    print(f"  {r['from']} -> {r['to']}: {r['volume']:,.0f} lbs (${r['cost']:,.2f})")
+print(f"SOLUTION_JSON:" + json.dumps({
+    "status": pulp.LpStatus[prob.status],
+    "objective": round(pulp.value(prob.objective), 2),
+    "solver": "Gurobi" if shutil.which("gurobi_cl") else "CBC",
+    "routes": routes[:50],
+    "sensitivity": sensitivity[:20],
+    "assumptions": ["$0.10/mile via haversine"],
+}, default=str))
+
+# ── Visualization ──────────────────────────────────────────────────
+# Create a bar chart of top routes by volume
+top_routes = routes[:15]
+if top_routes:
+    labels = [f"{r['from']} -> {r['to']}" for r in top_routes]
+    volumes = [r['volume'] for r in top_routes]
+    costs = [r['cost'] for r in top_routes]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        y=labels, x=volumes, orientation='h', name='Volume (lbs)',
+        marker_color='#2563eb', text=[f"${c:,.0f}" for c in costs],
+        textposition='outside',
+    ))
+    fig.update_layout(
+        title="Top Routes by Volume",
+        xaxis_title="Volume (lbs)", yaxis_title="",
+        yaxis=dict(autorange="reversed"),
+        height=max(400, len(labels) * 30 + 100),
+        margin=dict(l=250),
+    )
+    print("PLOTLY_JSON::" + pio.to_json(fig) + "::END_PLOTLY_JSON")
+```
+
+## IMPORTANT: Cost Column Handling
+When the data has a `transport_cost` or `cost` column, it is the TOTAL monthly cost
+for that route (NOT per-unit). To get per-unit cost coefficients for the LP:
+
+```python
+# When data has existing route costs:
+# transport_cost = TOTAL monthly cost (e.g., $12,083.94 for 468,497 lbs)
+# To get per-unit: divide by volume
+df["cost_per_lb"] = df["cost"] / df["volume"]  # e.g., $0.0258/lb
+
+# Use cost_per_lb as the LP coefficient, NOT the raw cost column:
+cost = {(i,j): routes_df.loc[matching_row, "cost_per_lb"]
+        for i in range(I) for j in range(J) if matching_row exists}
+
+# For NEW routes (not in data), estimate cost from distance:
+# cost_per_lb ≈ $0.10/mile × distance / avg_volume
+```
+
+NEVER use the raw `transport_cost` column directly as an LP coefficient.
+It is already multiplied by volume. Using it as `cost[i,j] * x[i,j]` would
+double-count the volume and produce absurdly high objective values (billions
+instead of thousands).
+
+## WORKED EXAMPLE: Facility Location (Single Facility — Weighted Centroid)
+
+For placing ONE new facility to minimize weighted distance, use the volume-weighted
+centroid (analytical solution). Do NOT use PuLP — this is non-linear.
+
+```python
+import json, math
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+import plotly.io as pio
+
+df = pd.read_json("data/cypher_results.json")
+
+# Deduplicate supply points (cooperatives/farms may appear in multiple rows)
+supply = df[["name", "lat", "lon", "volume"]].drop_duplicates("name").reset_index(drop=True)
+# Use appropriate column names from data — adapt as needed
+supply.columns = ["name", "lat", "lon", "weight"]
+
+# Weighted centroid: optimal single-facility location (minimizes weighted squared distance)
+total_weight = supply["weight"].sum()
+opt_lat = (supply["lat"] * supply["weight"]).sum() / total_weight
+opt_lon = (supply["lon"] * supply["weight"]).sum() / total_weight
+
+# Compute distances from optimal location to each supply point
+def haversine(lat1, lon1, lat2, lon2):
+    R = 3959  # miles
+    dlat, dlon = math.radians(lat2-lat1), math.radians(lon2-lon1)
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1))*math.cos(math.radians(lat2))*math.sin(dlon/2)**2
+    return R * 2 * math.asin(math.sqrt(a))
+
+supply["distance_miles"] = supply.apply(
+    lambda r: round(haversine(r.lat, r.lon, opt_lat, opt_lon), 2), axis=1
+)
+supply["weighted_distance"] = supply["distance_miles"] * supply["weight"]
+total_weighted_dist = supply["weighted_distance"].sum()
+
+# Build routes (connections from each supply point to optimal location)
+routes = []
+for _, row in supply.iterrows():
+    routes.append({
+        "from": row["name"], "to": "New Facility",
+        "volume": round(float(row["weight"]), 1),
+        "cost": round(float(row["distance_miles"]), 2),
+        "origin_lat": float(row.lat), "origin_lon": float(row.lon),
+        "dest_lat": float(opt_lat), "dest_lon": float(opt_lon),
+    })
+routes.sort(key=lambda r: r["volume"], reverse=True)
+
+print(f"Optimal location: ({opt_lat:.4f}, {opt_lon:.4f})")
+print(f"Total weighted distance: {total_weighted_dist:,.0f}")
+for r in routes[:5]:
+    print(f"  {r['from']}: {r['volume']:,.0f} lbs, {r['cost']:.1f} miles")
+
+print(f"SOLUTION_JSON:" + json.dumps({
+    "status": "Optimal",
+    "objective": round(total_weighted_dist, 2),
+    "solver": "WeightedCentroid",
+    "routes": routes[:50],
+    "sensitivity": [],
+    "assumptions": ["Weighted centroid minimizes sum of weighted squared distances",
+                    f"Optimal location: ({opt_lat:.4f}, {opt_lon:.4f})"],
+    "optimal_location": {"lat": round(opt_lat, 6), "lon": round(opt_lon, 6)},
+}, default=str))
+
+# Visualization: bar chart of distances
+top = supply.nlargest(15, "weight")
+fig = go.Figure()
+fig.add_trace(go.Bar(
+    y=top["name"], x=top["distance_miles"], orientation='h', name='Distance (miles)',
+    marker_color='#2563eb',
+    text=[f"{w:,.0f} lbs" for w in top["weight"]], textposition='outside',
+))
+fig.update_layout(
+    title=f"Distance to Optimal Facility Location ({opt_lat:.2f}, {opt_lon:.2f})",
+    xaxis_title="Distance (miles)", yaxis_title="",
+    yaxis=dict(autorange="reversed"),
+    height=max(400, len(top) * 30 + 100), margin=dict(l=250),
+)
+print("PLOTLY_JSON::" + pio.to_json(fig) + "::END_PLOTLY_JSON")
+```
+
+When problem_type is "facility_location":
+- For 1 facility: use weighted centroid (above pattern). No PuLP needed.
+- For N facilities: use PuLP p-median with candidate locations (use cooperative/county
+  centroids as candidates, binary selection variables).
+
+## Scale Guidelines
+- Up to 1000 supply × 100 demand = 100,000 variables: CBC solves in seconds. Use all entities.
+- Do NOT aggregate/rename entities to "Farm A", "Farm B" — use real names from the data.
+- When data has monthly_production_gal (gallons), convert to lbs: multiply by 8.6 (1 gal milk ≈ 8.6 lbs).
+
+## Handling Combined Datasets from Multiple Cypher Steps
+The data file (cypher_results.json) may contain rows from MULTIPLE Cypher queries
+concatenated together. Each row has a `_query_step` field indicating which query produced it.
+
+Split the data using `_query_step`:
+```python
+df = pd.read_json("data/cypher_results.json")
+
+# Split by _query_step (each Cypher query has a different step label)
+steps = df["_query_step"].unique()
+print(f"Data contains {len(steps)} query steps: {list(steps)}")
+
+# Typically: step 0 = supply entities, step 1 = demand entities
+supply_df = df[df["_query_step"] == steps[0]].drop(columns=["_query_step"])
+demand_df = df[df["_query_step"] == steps[1]].drop(columns=["_query_step"])
+
+# Handle dot-prefixed column names if present (e.g., 'f.name' → 'name')
+supply_df.columns = [c.split('.')[-1] if '.' in c else c for c in supply_df.columns]
+demand_df.columns = [c.split('.')[-1] if '.' in c else c for c in demand_df.columns]
+
+# Drop NaN columns (from the other step's schema)
+supply_df = supply_df.dropna(axis=1, how='all')
+demand_df = demand_df.dropna(axis=1, how='all')
+```
+
+IMPORTANT: After splitting, use the REAL entity names from the `name` column
+in each DataFrame. Do NOT rename entities to generic labels like "Farm A" or "Processor 1".
+
+## Adapt the above pattern to your specific formulation. Key rules:
+1. Use INTEGER INDICES for PuLP variable names (0,1,2,...), NOT entity names
+2. Build entity DataFrames by selecting + deduplicating columns from joined Cypher results.
+   Use REAL entity names in the routes output (from the DataFrame), not generic labels.
+3. Include lat/lon in every route dict for map rendering
+4. Make sensitivity conditional: LP → shadow prices, MILP → skip with note
+5. NEVER use literal newlines in f-strings. Use \n instead.
+6. Wrap solver selection in shutil.which check
+7. Output SOLUTION_JSON: on a single line (no line breaks in the JSON)
+8. Use numeric_only=True for aggregation functions
+
+## Visualization Protocol (CRITICAL)
+After solving, create ONE or TWO Plotly charts that summarize the solution.
+Output each chart using these EXACT markers:
+
+```python
+import plotly.io as pio
+print("PLOTLY_JSON::" + pio.to_json(fig) + "::END_PLOTLY_JSON")
+```
+
+Do NOT use fig.show(). Do NOT save chart files. The JSON IS the output.
+
+**Chart type by problem type:**
+- **Transportation/routing**: horizontal bar chart of top routes by volume
+- **Facility location**: bar chart showing selected vs rejected facilities with capacity
+- **Inventory**: line chart of inventory levels over time
+- **Assignment**: grouped bar chart of assignments by resource
+- **Blending/mixing**: stacked bar chart of ingredient proportions
+- **General**: bar chart of decision variable values
+
+**Styling rules:**
+- Descriptive title including objective value (e.g., "Optimal Routes — Total Cost: $12,345")
+- Axis labels with units
+- Horizontal bars for long entity names (>8 chars)
+- Limit to top 15-20 items for readability
+- Use color encoding: #2563eb (primary), #16a34a (secondary), #dc2626 (alert)
+
+## Available libraries
+pulp, pandas, numpy, math, json, shutil, plotly

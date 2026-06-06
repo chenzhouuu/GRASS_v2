@@ -1,0 +1,42 @@
+# Core LangChain / LangGraph
+langchain>=0.3.24
+langchain-core>=0.3.55
+langgraph-checkpoint-sqlite>=2.0.11,<3
+langchain-openai>=0.3.14
+langchain-anthropic>=0.3.0
+langchain-google-genai>=2.0.0
+langchain-community>=0.3.0
+langchain-groq>=0.2.0
+langgraph>=0.3.32
+langchain-mcp-adapters>=0.1.0
+
+# Neo4j
+neo4j>=5.0
+neo4j-mcp-server>=1.5.2
+
+# Data analysis
+pandas>=2.1
+scipy>=1.12
+
+# Visualization (Plotly — frontend renders via react-plotly.js)
+plotly>=5.18
+
+# Optimization
+PuLP>=2.7
+
+# PDF generation
+fpdf2>=2.7
+
+# Tracing / observability
+langsmith>=0.1.0
+
+# Utilities
+python-dotenv>=1.0
+pyyaml>=6.0
+
+# FastAPI server
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+sse-starlette>=2.1.0
+python-multipart>=0.0.9
+aiosqlite>=0.20.0
