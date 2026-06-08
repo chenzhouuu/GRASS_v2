@@ -120,19 +120,35 @@ class CypherAgent:
         return result
 
     def _prepare_messages(self, state: dict[str, Any]) -> list:
-        messages = [SystemMessage(content=self.system_prompt)]
-        messages.extend(list(state.get("messages", [])))
+        """Build a scoped prompt: system + user request + current task.
 
-        worker_task = state.get("worker_task", "")
+        Deliberately does NOT replay the accumulated ``messages`` transcript.
+        Under the progress-ledger executor a worker can be re-dispatched several
+        times within a single user turn; replaying its own prior summaries
+        few-shot-primes the model to reproduce its last query and ignore the new
+        instruction (observed in a smoke run: an identical county-count query
+        re-emitted for 6+ rounds while the ledger kept asking for a different
+        retrieval). Mirrors the Analytics/Optimization workers, which build from
+        ``worker_task`` + ``user_query`` rather than the raw history.
+        """
+        messages: list = [SystemMessage(content=self.system_prompt)]
+
+        user_query = (state.get("user_query") or "").strip()
+        worker_task = (state.get("worker_task") or "").strip()
+
+        parts: list[str] = []
+        if user_query:
+            parts.append(f"User request (overall intent):\n{user_query}")
         if worker_task:
-            messages.append(
-                HumanMessage(
-                    content=(
-                        "YOUR CURRENT TASK (execute this, ignore previous tasks):\n"
-                        f"{worker_task}"
-                    )
-                )
+            parts.append(
+                "Your current task — execute EXACTLY this retrieval, even if it "
+                "differs from earlier queries in the conversation:\n"
+                f"{worker_task}"
             )
+        if not parts:
+            parts.append("Retrieve the data required to answer the user's request.")
+
+        messages.append(HumanMessage(content="\n\n".join(parts)))
         return messages
 
     def _run_react_loop(self, messages: list) -> dict[str, Any]:

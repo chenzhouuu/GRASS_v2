@@ -24,6 +24,8 @@ BACKEND_TO_FRONTEND_AGENT = {
     "analytics_agent": "Analytics",
     "optimization_agent": "Optimization",
     "report_agent": "Report",
+    "planner_agent": "Planner",
+    "executor_agent": "Executor",
 }
 FRONTEND_TO_BACKEND_AGENT = {
     frontend: backend for backend, frontend in BACKEND_TO_FRONTEND_AGENT.items()
