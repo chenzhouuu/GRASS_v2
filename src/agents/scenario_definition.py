@@ -10,6 +10,7 @@ import logging
 import uuid
 from typing import Any
 
+from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
 from ..core.schemas import OptimizationRun, Perturbation, Scenario
@@ -54,14 +55,14 @@ def scenario_from_request(
 
     schema_txt = format_summary_for_prompt(summarize_data(baseline.input_data or []))
     obj = baseline.formulation.objective
-    prompt = (
-        f"{_SYSTEM}\n\n"
+    user_content = (
         f"## Baseline data schema\n{schema_txt}\n\n"
         f"## Baseline objective\n{obj.sense} {obj.expression}\n\n"
         f"## What-if request\n{request_text}"
     )
+    messages = [SystemMessage(content=_SYSTEM), HumanMessage(content=user_content)]
     try:
-        draft = model.with_structured_output(_ScenarioDraft).invoke(prompt)
+        draft = model.with_structured_output(_ScenarioDraft).invoke(messages)
     except Exception as exc:  # noqa: BLE001 — any LLM/parse failure is non-fatal
         logger.warning("scenario_from_request: structured-output failed: %s", exc)
         return None
