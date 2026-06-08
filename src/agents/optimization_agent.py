@@ -23,7 +23,6 @@ import re
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-from pydantic import ValidationError
 
 from ..core.schemas import OptimizationFormulation
 from ..tools.python_executor import execute_python, persist_cypher_results

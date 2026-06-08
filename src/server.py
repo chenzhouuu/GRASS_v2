@@ -5,16 +5,13 @@ It provides REST endpoints and SSE streaming for real-time agent progress update
 """
 
 import logging
-import os
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
 
 import aiosqlite
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from .utils.neo4j_connection import (

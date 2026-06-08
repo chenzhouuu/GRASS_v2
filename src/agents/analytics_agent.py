@@ -18,7 +18,6 @@ Design informed by:
     # result["chart_specs"]       - list of Plotly JSON dicts (or None)
 """
 
-import json
 import logging
 from typing import Any
 
@@ -28,7 +27,6 @@ from ..tools.python_executor import execute_python, persist_cypher_results
 from ..utils.data_summarizer import summarize_data, format_summary_for_prompt, make_data_preview
 from ..utils.prompt_loader import load_prompt
 from ..utils.plotly_markers import (
-    PLOTLY_PATTERN as _PLOTLY_PATTERN,
     extract_plotly_specs as _extract_plotly_specs_from_text,
     strip_plotly_markers as _strip_plotly_markers_text,
 )

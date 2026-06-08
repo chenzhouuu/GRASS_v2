@@ -8,7 +8,6 @@ Plotly chart specs from subprocess stdout. Used by both the Analytics Agent
 import json
 import logging
 import re
-from typing import Any
 
 logger = logging.getLogger(__name__)
 
