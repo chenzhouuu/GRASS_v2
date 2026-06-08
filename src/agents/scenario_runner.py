@@ -60,10 +60,23 @@ class ScenarioRunner:
         if state.get("pending_sweep"):
             return self.run_sweep(state)
 
-        if not scenario_dict:
-            return self._blocked("No scenario was provided to run.", state)
-
         baseline = OptimizationRun.model_validate(baseline_dict)
+
+        if not scenario_dict:
+            # Plan mode: no pre-built scenario — derive one from the step instruction.
+            from .scenario_definition import scenario_from_request
+
+            derived = scenario_from_request(
+                self.model, state.get("worker_task", "") or "", baseline
+            )
+            if derived is None:
+                return self._blocked(
+                    "No scenario was provided, and I couldn't derive a valid "
+                    "what-if from the step instruction.",
+                    state,
+                )
+            scenario_dict = derived.model_dump()
+
         scenario = Scenario.model_validate(scenario_dict)
 
         if not baseline.code:
