@@ -6,6 +6,8 @@ import { useAgentStore } from "@/stores/agentStore";
 import { UserMessage } from "./UserMessage";
 import { AssistantMessage } from "./AssistantMessage";
 import { StreamingIndicator } from "./StreamingIndicator";
+import { PlanReviewCard } from "./PlanReviewCard";
+import { PlanExecutionTimeline } from "./PlanExecutionTimeline";
 import { ChevronDown, BarChart3, Loader2 } from "lucide-react";
 
 interface MessageListProps {
@@ -15,6 +17,7 @@ interface MessageListProps {
 export function MessageList({ onSendMessage }: MessageListProps) {
   const messages = useChatStore((s) => s.messages);
   const isStreaming = useChatStore((s) => s.isStreaming);
+  const pendingReview = useChatStore((s) => s.pendingReview);
   const livePipeline = useAgentStore((s) => s.livePipeline);
   const bottomRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -72,8 +75,13 @@ export function MessageList({ onSendMessage }: MessageListProps) {
                 key={message.id}
                 className={isTurnSwitch ? "mt-6" : "mt-3"}
               >
-                {isStreaming && isLastMessage && isAssistant && !message.content && (
+                {isStreaming && isLastMessage && isAssistant && !message.content
+                  && !message.ledgerProgress && (
                   <StreamingIndicator />
+                )}
+
+                {isAssistant && message.ledgerProgress && (
+                  <PlanExecutionTimeline progress={message.ledgerProgress} />
                 )}
 
                 {message.content && (
@@ -85,6 +93,13 @@ export function MessageList({ onSendMessage }: MessageListProps) {
                       onSendMessage={onSendMessage}
                     />
                   )
+                )}
+
+                {isAssistant && pendingReview?.assistantMessageId === message.id && (
+                  <PlanReviewCard
+                    payload={pendingReview.payload}
+                    assistantMessageId={message.id}
+                  />
                 )}
 
                 {isStreaming && isLastMessage && isAssistant && currentAgent === "Analytics"

@@ -7,10 +7,14 @@ import type {
   AgentName,
   AgentStatus,
   ChartSpecPayload,
+  CoPlanStep,
   GeoDataPayload,
   GRASSPlan,
+  LedgerProgress,
   MapPayload,
+  NvlGraphResult,
   PipelineRun,
+  PlanReviewPayload,
   StreamAgentName,
   VisualizationData,
 } from "@/lib/types";
@@ -39,6 +43,23 @@ export function connectSSE(
   return () => controller.abort();
 }
 
+/**
+ * Resumes a paused co-planning run with the human's decision and streams the
+ * continuation (the POST /api/chat/plan-decision response is itself an SSE
+ * stream). Returns an abort function.
+ */
+export function submitPlanDecision(params: {
+  runId: string;
+  assistantMessageId: string;
+  decision: "accept" | "revise";
+  steps?: CoPlanStep[];
+  content?: string;
+}): () => void {
+  const controller = new AbortController();
+  resumeRun(params, controller.signal);
+  return () => controller.abort();
+}
+
 // ─── Internal stream reader ─────────────────────────────────────────────────
 
 async function readStream(
@@ -46,8 +67,59 @@ async function readStream(
   assistantMessageId: string,
   signal: AbortSignal,
 ) {
+  let res: Response;
   try {
-    const res = await fetch(apiUrl(`/api/stream/${runId}`), { signal });
+    res = await fetch(apiUrl(`/api/stream/${runId}`), { signal });
+  } catch (err: unknown) {
+    if (signal.aborted) return;
+    const msg = err instanceof Error ? err.message : "Unknown stream error";
+    useChatStore.getState().updateMessage(assistantMessageId, { content: `Error: ${msg}` });
+    useChatStore.getState().setStreaming(false);
+    return;
+  }
+  await consumeStream(res, assistantMessageId, signal);
+}
+
+async function resumeRun(
+  params: {
+    runId: string;
+    assistantMessageId: string;
+    decision: "accept" | "revise";
+    steps?: CoPlanStep[];
+    content?: string;
+  },
+  signal: AbortSignal,
+) {
+  const { runId, assistantMessageId, decision, steps, content } = params;
+  const chat = useChatStore.getState();
+  chat.setPendingReview(null);
+  chat.setStreaming(true, runId);
+
+  let res: Response;
+  try {
+    res = await fetch(apiUrl("/api/chat/plan-decision"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ run_id: runId, decision, steps, content }),
+      signal,
+    });
+  } catch (err: unknown) {
+    if (signal.aborted) return;
+    const msg = err instanceof Error ? err.message : "Unknown stream error";
+    chat.updateMessage(assistantMessageId, { content: `Error: ${msg}` });
+    chat.setStreaming(false);
+    return;
+  }
+  await consumeStream(res, assistantMessageId, signal);
+}
+
+/** Pump an SSE Response body through the frame parser + dispatcher. */
+async function consumeStream(
+  res: Response,
+  assistantMessageId: string,
+  signal: AbortSignal,
+) {
+  try {
     if (!res.ok || !res.body) {
       useChatStore.getState().updateMessage(assistantMessageId, {
         content: `Error: Stream connection failed (${res.status})`,
@@ -97,8 +169,10 @@ async function readStream(
     });
   } finally {
     useChatStore.getState().setStreaming(false);
+    // If the run paused at the plan gate, keep the pipeline alive for resume.
+    const paused = !!useChatStore.getState().pendingReview;
     const pipeline = useAgentStore.getState().livePipeline;
-    if (pipeline) {
+    if (pipeline && !paused) {
       useAgentStore.getState().completePipeline();
     }
   }
@@ -219,15 +293,52 @@ function dispatch(
       break;
     }
 
+    case "plan_review": {
+      // Co-planning gate: surface the editable plan for human review.
+      const payload = data as PlanReviewPayload;
+      useChatStore.getState().setPendingReview({ payload, assistantMessageId });
+      break;
+    }
+
+    case "plan_pending": {
+      // Graph paused at the gate — stop the spinner; run stays alive for the
+      // decision (pendingReview holds run_id). completePipeline is skipped in
+      // consumeStream's finally because pendingReview is set.
+      useChatStore.getState().setStreaming(false);
+      break;
+    }
+
+    case "progress": {
+      // Live progress-ledger checklist: attach the latest snapshot to the
+      // assistant message so the execution timeline renders + persists.
+      const progress = data as LedgerProgress;
+      useChatStore.getState().updateMessage(assistantMessageId, {
+        ledgerProgress: progress,
+      });
+      useAgentStore.getState().recordEvent("progress");
+      break;
+    }
+
     case "cypher_query": {
       useAppStore.getState().setTabBadge("data", { type: "new" });
       const query = d.query as string;
-      const rows = d.results as Record<string, unknown>[];
-      const columns = rows.length > 0 ? Object.keys(rows[0]) : [];
+      const rows = (d.results as Record<string, unknown>[]) ?? [];
+      const columns = Array.isArray(d.columns) && d.columns.length > 0
+        ? (d.columns as string[])
+        : rows.length > 0
+          ? Object.keys(rows[0])
+          : [];
 
       const db = useDatabaseStore.getState();
       db.setQuery(query);
-      const result = { query, columns, rows };
+      const result = {
+        query,
+        columns,
+        rows,
+        graph: (d.graph as NvlGraphResult | null | undefined) ?? null,
+        graphTruncated: d.graph_truncated as boolean | undefined,
+        graphWarnings: (d.graph_warnings as string[] | undefined) ?? [],
+      };
       db.setResults(result);
       db.addToHistory(result);
 

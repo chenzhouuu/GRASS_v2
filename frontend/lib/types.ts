@@ -38,6 +38,56 @@ export interface GRASSPlan {
 
 export type PlanDecision = "approved" | "modified" | "cancelled";
 
+// ─── Co-planning (SSE: plan_review / plan_pending) ──────────────────────────
+// Mirrors the backend Plan/PlanStep contract (Magentic-UI port). Distinct from
+// the legacy GRASSPlan/PlanStep above (which back the read-only `plan` event).
+
+export interface CoPlanStep {
+  title: string;
+  details: string;
+  agent: AgentName;
+  enabled?: boolean;
+}
+
+export interface CoPlan {
+  task?: string | null;
+  summary?: string;
+  steps: CoPlanStep[];
+  requires_geo?: boolean;
+  requires_optimization?: boolean;
+}
+
+export interface PlanReviewPayload {
+  run_id: string;
+  plan: CoPlan;
+  plan_str?: string;
+  summary?: string;
+  message?: string;
+}
+
+// ─── Ledger execution progress (SSE: progress) ──────────────────────────────
+// Live per-step checklist streamed while an approved plan runs through the
+// progress-ledger Executor. Drives the execution-timeline UI.
+
+export type LedgerStepStatus = "pending" | "running" | "done" | "error";
+
+export type LedgerPhase = "executing" | "replanning" | "finalizing" | "complete";
+
+export interface LedgerProgressStep {
+  index: number;
+  title: string;
+  agent: AgentName;
+  status: LedgerStepStatus;
+}
+
+export interface LedgerProgress {
+  phase: LedgerPhase;
+  current_step: number;
+  total_steps: number;
+  summary: string;
+  steps: LedgerProgressStep[];
+}
+
 // ─── Chat messages ──────────────────────────────────────────────────────────
 
 export type MessageRole = "user" | "assistant";
@@ -57,6 +107,7 @@ export interface Message {
   agentProgress?: AgentStatus[];
   plan?: GRASSPlan;
   planDecision?: PlanDecision;
+  ledgerProgress?: LedgerProgress;
   attachments?: MessageAttachment[];
   visualizations?: VisualizationData[];
   mapData?: MapPayload;
@@ -64,12 +115,47 @@ export interface Message {
 
 // ─── Cypher / Database (SSE: cypher_query) ──────────────────────────────────
 
+export interface NvlGraphNode {
+  id: string;
+  labels?: string[];
+  caption?: string;
+  properties?: Record<string, unknown>;
+}
+
+export interface NvlGraphRelationship {
+  id: string;
+  from: string;
+  to: string;
+  type?: string;
+  caption?: string;
+  properties?: Record<string, unknown>;
+}
+
+export interface NvlGraphResult {
+  nodes: NvlGraphNode[];
+  relationships: NvlGraphRelationship[];
+  stats?: {
+    nodeCount: number;
+    relationshipCount: number;
+    truncated?: boolean;
+  };
+  warnings?: string[];
+}
+
+export type DatabaseResultsViewMode = "table" | "graph" | "raw";
+
 export interface CypherResult {
   query: string;
   columns: string[];
   rows: Record<string, unknown>[];
   executionTimeMs?: number;
   error?: string;
+  truncated?: boolean;
+  source?: string;
+  validationWarnings?: string[];
+  graph?: NvlGraphResult | null;
+  graphTruncated?: boolean;
+  graphWarnings?: string[];
 }
 
 export interface SchemaNode {
@@ -80,6 +166,7 @@ export interface SchemaNode {
 export interface SchemaRelationship {
   type: string;
   properties: string[];
+  pattern?: string | null;
 }
 
 export interface Neo4jSchema {
@@ -239,4 +326,7 @@ export type SSEEvent =
   | { event: "response"; data: { markdown: string } }
   | { event: "error"; data: { agent: StreamAgentName; step_id?: string | null; error: string } }
   | { event: "plan"; data: GRASSPlan }
+  | { event: "plan_review"; data: PlanReviewPayload }
+  | { event: "plan_pending"; data: { run_id: string } }
+  | { event: "progress"; data: LedgerProgress }
   | { event: "done"; data: Record<string, never> };

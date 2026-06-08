@@ -18,6 +18,7 @@ export interface ChatRequest {
   message: string;
   session_id?: string;
   region_bbox?: string;
+  mode?: string;
 }
 
 interface ChatResponse {
@@ -74,6 +75,7 @@ export async function sendChatMessage(content: string, sessionId?: string) {
         message: content,
         session_id: activeSessionId,
         region_bbox: regionBbox,
+        mode: useChatStore.getState().planMode ? "plan" : "direct",
       } satisfies ChatRequest),
     });
 

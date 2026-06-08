@@ -5,6 +5,7 @@ import { ArrowUp, MapPin, X } from "lucide-react";
 import { useChatStore } from "@/stores/chatStore";
 import { useMapStore } from "@/stores/mapStore";
 import { cn } from "@/lib/utils";
+import { PlanModeToggle } from "./PlanModeToggle";
 
 interface ChatInputProps {
   onSend: (content: string) => void;
@@ -119,6 +120,11 @@ export function ChatInput({ onSend }: ChatInputProps) {
           >
             <ArrowUp className="h-4 w-4" />
           </button>
+        </div>
+
+        {/* Composer action row */}
+        <div className="mt-2 flex items-center">
+          <PlanModeToggle />
         </div>
       </div>
     </div>

@@ -6,6 +6,7 @@ import type {
   AgentStatusValue,
   GRASSPlan,
   PlanDecision,
+  PlanReviewPayload,
 } from "@/lib/types";
 
 interface ChatState {
@@ -26,11 +27,20 @@ interface ChatState {
   updateAgentStatus: (agent: AgentName, status: AgentStatusValue, extra?: Partial<AgentStatus>) => void;
   resetAgentProgress: () => void;
 
-  // ── Plan (human-in-the-loop) ────────────────────────────────────────────
+  // ── Plan (legacy read-only plan event) ──────────────────────────────────
   pendingPlan: GRASSPlan | null;
   planDecision: PlanDecision | null;
   setPendingPlan: (plan: GRASSPlan | null) => void;
   decidePlan: (decision: PlanDecision) => void;
+
+  // ── Co-planning mode (human approval gate) ───────────────────────────────
+  planMode: boolean;                       // user toggle: send mode="plan"
+  setPlanMode: (on: boolean) => void;
+  // The active gate awaiting a decision, tied to its assistant message.
+  pendingReview: { payload: PlanReviewPayload; assistantMessageId: string } | null;
+  setPendingReview: (
+    review: { payload: PlanReviewPayload; assistantMessageId: string } | null,
+  ) => void;
 
   // ── Input draft ─────────────────────────────────────────────────────────
   inputDraft: string;
@@ -90,11 +100,17 @@ export const useChatStore = create<ChatState>((set) => ({
   resetAgentProgress: () =>
     set({ agentProgress: [], currentAgent: null }),
 
-  // Plan
+  // Plan (legacy)
   pendingPlan: null,
   planDecision: null,
   setPendingPlan: (plan) => set({ pendingPlan: plan, planDecision: null }),
   decidePlan: (decision) => set({ planDecision: decision, pendingPlan: null }),
+
+  // Co-planning mode
+  planMode: false,
+  setPlanMode: (on) => set({ planMode: on }),
+  pendingReview: null,
+  setPendingReview: (review) => set({ pendingReview: review }),
 
   // Input draft
   inputDraft: "",
