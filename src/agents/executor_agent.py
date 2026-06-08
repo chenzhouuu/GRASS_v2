@@ -295,6 +295,7 @@ class ExecutorAgent:
             f"opt={str(state.get('optimization_solution') or '')[:200]}",
             f"operr={state.get('optimization_error') or ''}",
             f"report={state.get('report_file') or ''}",
+            f"scen={bool(state.get('scenario_comparison'))}|runs={len(state.get('scenario_runs') or [])}",
         ]
         return "|".join(parts)
 

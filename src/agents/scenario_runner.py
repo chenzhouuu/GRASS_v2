@@ -42,8 +42,10 @@ class ScenarioRunner:
     agent_name = "scenario_runner"
 
     def __init__(self, model: Any = None):
-        # ``model`` is unused in P1 (deterministic). Reserved for P3 structural
-        # perturbations, which edit the formulation via the LLM.
+        # ``model`` is used for plan-mode scenario derivation (via
+        # scenario_from_request) and for P3 structural perturbations.
+        # ``model=None`` is only safe in the deterministic direct-mode path
+        # where ``pending_scenario`` is already pre-built by the caller.
         self.model = model
 
     def invoke(self, state: dict[str, Any]) -> dict[str, Any]:
