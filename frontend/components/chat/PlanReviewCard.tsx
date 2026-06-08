@@ -18,7 +18,7 @@ import {
   EyeOff,
 } from "lucide-react";
 
-const WORKER_AGENTS: AgentName[] = ["Cypher", "Analytics", "Optimization", "Report"];
+const WORKER_AGENTS: AgentName[] = ["Cypher", "Analytics", "Optimization", "Report", "ScenarioRunner"];
 
 interface PlanReviewCardProps {
   payload: PlanReviewPayload;

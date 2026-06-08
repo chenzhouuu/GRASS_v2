@@ -5,7 +5,8 @@ export type AgentName =
   | "Cypher"
   | "Analytics"
   | "Optimization"
-  | "Report";
+  | "Report"
+  | "ScenarioRunner";
 
 export type StreamAgentName = AgentName | "System";
 
@@ -209,6 +210,147 @@ export interface SavedQuery {
   name: string;
   query: string;
   createdAt: number;
+}
+
+// ─── Live Neo4j Database Dashboard ──────────────────────────────────────────
+
+export interface DatabaseOverviewConnection {
+  connected: boolean;
+  uri: string;
+  database: string;
+  source: string;
+}
+
+export interface DatabaseOverviewStats {
+  nodeCount: number;
+  relationshipCount: number;
+  labelCount: number;
+  relationshipTypeCount: number;
+  propertyKeyCount: number;
+}
+
+export interface DatabaseOverviewProperty {
+  name: string;
+  types: string[];
+  mandatory?: boolean | null;
+}
+
+export interface DatabaseOverviewLabel {
+  label: string;
+  count: number;
+  properties: DatabaseOverviewProperty[];
+}
+
+export interface DatabaseOverviewPattern {
+  startLabels: string[];
+  relationshipType: string;
+  endLabels: string[];
+  count: number;
+  sampled?: boolean;
+  sampleLimit?: number | null;
+}
+
+export interface DatabaseOverviewRelationshipType {
+  type: string;
+  count: number;
+  properties: DatabaseOverviewProperty[];
+  patterns: DatabaseOverviewPattern[];
+}
+
+export interface GeneratedDatabaseCard {
+  id: string;
+  type: DashboardCardKind;
+  title: string;
+  description: string;
+  cypher?: string | null;
+  dataKey?: string | null;
+}
+
+export interface DatabaseOverview {
+  connection: DatabaseOverviewConnection;
+  stats: DatabaseOverviewStats;
+  labels: DatabaseOverviewLabel[];
+  relationships: DatabaseOverviewRelationshipType[];
+  patterns: DatabaseOverviewPattern[];
+  schemaGraph: NvlGraphResult;
+  sampleGraph: NvlGraphResult;
+  generatedCards: GeneratedDatabaseCard[];
+  warnings: string[];
+  source: "apoc" | "fallback";
+}
+
+export type DatabaseSchemaOverview = DatabaseOverview;
+
+export type DashboardCardKind =
+  | "kpi"
+  | "bar"
+  | "table"
+  | "map"
+  | "network"
+  | "sankey"
+  | "insight"
+  | "schemaGraph"
+  | "sampleGraph"
+  | "quality";
+
+export type DashboardCardLayer = "operational" | "schema";
+export type DashboardCardStatus = "success" | "error" | "timeout";
+export type DashboardCardSize = "small" | "medium" | "large" | "wide";
+
+export interface DashboardContext {
+  connection: DatabaseOverviewConnection;
+  fingerprint: string;
+  generatedAt: string;
+  warnings: string[];
+}
+
+export interface DashboardCardDrilldown {
+  kind: "cypher" | "pattern" | "label";
+  template: string;
+}
+
+export interface DashboardCardDefinition {
+  id: string;
+  layer: DashboardCardLayer;
+  type: DashboardCardKind;
+  title: string;
+  description: string;
+  cypher?: string | null;
+  dataKey?: string | null;
+  exact: boolean;
+  priority: number;
+  unit?: string | null;
+  valueFormat?: string | null;
+  size?: DashboardCardSize;
+  timeoutMs?: number;
+  display?: Record<string, unknown>;
+  drilldown?: DashboardCardDrilldown | null;
+  domain?: string | null;
+}
+
+export interface DashboardCatalog {
+  fingerprint: string;
+  cards: DashboardCardDefinition[];
+  detectedLabels: string[];
+  domainProfile: string;
+}
+
+export interface DashboardCardExecuteRequest {
+  cardId: string;
+  cypher: string;
+  fingerprint: string;
+  timeoutMs?: number;
+}
+
+export interface DashboardCardResult {
+  cardId: string;
+  status: DashboardCardStatus;
+  value?: number | null;
+  rows?: Array<Record<string, unknown>>;
+  executionMs: number;
+  error?: string | null;
+  sampled?: boolean;
+  sampleNote?: string | null;
 }
 
 // ─── Map (SSE: map_data) ────────────────────────────────────────────────────

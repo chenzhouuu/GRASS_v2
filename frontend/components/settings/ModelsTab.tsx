@@ -53,6 +53,7 @@ const AGENT_META: Record<AgentName, { icon: React.ElementType; desc: string }> =
   Analytics: { icon: BarChart3, desc: "Data analysis + charts" },
   Optimization: { icon: TrendingUp, desc: "Supply chain optimization" },
   Report: { icon: FileText, desc: "PDF report generation" },
+  ScenarioRunner: { icon: TrendingUp, desc: "What-if scenario re-solve" },
 };
 
 // ─── Agent model card ────────────────────────────────────────────────────────
