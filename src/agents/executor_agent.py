@@ -41,12 +41,15 @@ MAX_JSON_RETRIES = 3
 # (a worker that keeps returning the same result can never complete its step).
 MAX_STALL_ROUNDS = 2
 
-WORKER_AGENTS = ["Cypher", "Analytics", "Optimization", "Report"]
+WORKER_AGENTS = ["Cypher", "Analytics", "Optimization", "Report", "ScenarioRunner"]
 
 _TEAM_DESCRIPTION = """\
 - Cypher: Neo4j graph queries (retrieval, aggregation, spatial lookups).
 - Analytics: Python analysis (pandas/scipy) + Plotly charts.
 - Optimization: LP/MILP optimization via PuLP.
+- ScenarioRunner: what-if re-solve of a prior Optimization baseline under a
+  perturbation (demand/cost ±%, capacity change, entity outage). REQUIRES a
+  preceding Optimization step in the same plan to establish the baseline.
 - Report: PDF report generation (only after data + analysis are complete)."""
 
 _LEDGER_SCHEMA = """\
@@ -56,7 +59,7 @@ Output PURE JSON, parsable as-is, with no surrounding text, matching this schema
     "is_current_step_complete": { "reason": "string", "answer": true_or_false },
     "need_to_replan":           { "reason": "string", "answer": true_or_false },
     "instruction_or_question":  { "answer": "concrete instruction for the worker",
-                                   "agent_name": "one of: Cypher, Analytics, Optimization, Report" },
+                                   "agent_name": "one of: Cypher, Analytics, Optimization, ScenarioRunner, Report" },
     "progress_summary": "one or two sentence summary of progress so far"
 }"""
 
