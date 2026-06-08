@@ -13,7 +13,7 @@ from .state import GRASSState
 
 logger = logging.getLogger(__name__)
 
-VALID_WORKERS = {"Cypher", "Analytics", "Optimization", "Report"}
+VALID_WORKERS = {"Cypher", "Analytics", "Optimization", "Report", "ScenarioRunner"}
 
 
 def supervisor_router(state: GRASSState) -> str:
@@ -65,7 +65,7 @@ def plan_gate_router(state: GRASSState) -> str:
 
 # ── Progress-ledger executor routers (Step 4) ────────────────────────
 
-_EXECUTOR_WORKERS = {"Cypher", "Analytics", "Optimization", "Report"}
+_EXECUTOR_WORKERS = {"Cypher", "Analytics", "Optimization", "Report", "ScenarioRunner"}
 
 
 def executor_router(state: GRASSState) -> str:

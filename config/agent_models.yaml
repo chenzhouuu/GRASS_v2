@@ -34,3 +34,8 @@ agents:
     model_config:
       model: gpt-5.4-mini
       temperature: 0
+  scenario_runner:
+    provider: openai
+    model_config:
+      model: gpt-5.4-mini
+      temperature: 0

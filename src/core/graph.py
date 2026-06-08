@@ -73,6 +73,7 @@ def build_graph(
     checkpointer=None,
     planner_agent=None,
     executor_agent=None,
+    scenario_runner=None,
     *,
     tracing: bool | None = None,
     langsmith_project: str | None = None,
@@ -113,6 +114,13 @@ def build_graph(
         "Report",
         _wrap_agent(report_agent, "Report") if report_agent else _make_stub("Report"),
     )
+
+    # -- what-if scenario runner (only when wired) --------------------
+    # Dormant until the Supervisor/Planner can dispatch to it (P4); when
+    # absent, the graph is unchanged.
+    scenario_enabled = scenario_runner is not None
+    if scenario_enabled:
+        workflow.add_node("ScenarioRunner", _wrap_agent(scenario_runner, "ScenarioRunner"))
 
     # -- co-planning nodes (only when a Planner is wired) -------------
     # When absent, the graph is identical to the react-only architecture
@@ -155,7 +163,7 @@ def build_graph(
 
     # -- progress-ledger executor edges -------------------------------
     if ledger_enabled:
-        workflow.add_conditional_edges("Executor", executor_router, {
+        executor_targets = {
             "Cypher": "Cypher",
             "Analytics": "Analytics",
             "Optimization": "Optimization",
@@ -163,23 +171,32 @@ def build_graph(
             "Executor": "Executor",   # step completed -> re-evaluate next step
             "Replan": "Replan",
             "Finalize": "Finalize",
-        })
+        }
+        if scenario_enabled:
+            executor_targets["ScenarioRunner"] = "ScenarioRunner"
+        workflow.add_conditional_edges("Executor", executor_router, executor_targets)
         workflow.add_edge("Finalize", END)
 
     # Supervisor -> conditional routing
-    workflow.add_conditional_edges("Supervisor", supervisor_router, {
+    supervisor_targets = {
         "Cypher": "Cypher",
         "Analytics": "Analytics",
         "Optimization": "Optimization",
         "Report": "Report",
         END: END,
-    })
+    }
+    if scenario_enabled:
+        supervisor_targets["ScenarioRunner"] = "ScenarioRunner"
+    workflow.add_conditional_edges("Supervisor", supervisor_router, supervisor_targets)
 
     # Workers return for evaluation. With the ledger executor wired, the
     # return target depends on execution_engine ("ledger" -> Executor, else
     # Supervisor); otherwise it is statically the Supervisor (unchanged graph).
+    return_workers = ["Cypher", "Analytics", "Optimization"]
+    if scenario_enabled:
+        return_workers.append("ScenarioRunner")
     if ledger_enabled:
-        for worker in ["Cypher", "Analytics", "Optimization"]:
+        for worker in return_workers:
             workflow.add_conditional_edges(worker, worker_return_router, {
                 "Supervisor": "Supervisor",
                 "Executor": "Executor",
@@ -190,7 +207,7 @@ def build_graph(
             END: END,
         })
     else:
-        for worker in ["Cypher", "Analytics", "Optimization"]:
+        for worker in return_workers:
             workflow.add_edge(worker, "Supervisor")
         workflow.add_edge("Report", END)
 

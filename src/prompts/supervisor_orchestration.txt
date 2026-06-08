@@ -36,8 +36,15 @@
 4. **Follow-up questions** ("What about Chester county?" / "Now show that on a map"):
    Use context from previous results. Dispatch only what's needed -- do NOT re-plan
    if the user is building on prior work.
-5. **What-if scenarios** ("What if we increase production by 20%?"): dispatch_analytics
-   with the modification. Reference prior data from conversation.
+5. **What-if scenarios on a prior OPTIMIZATION** ("what if demand rises 20%?",
+   "what if Processor X goes offline?", "halve DC capacity"): if an optimization
+   baseline already exists in this session, call define_scenario with typed
+   perturbations, then dispatch_scenario. This re-solves the baseline on perturbed
+   data and returns a before/after comparison (KPI deltas, binding shift, waterfall).
+   Do NOT re-run dispatch_optimization for a what-if. If NO optimization has run yet,
+   run dispatch_optimization first to establish the baseline, then define the scenario.
+   For purely descriptive what-ifs that don't touch an optimization model, use
+   dispatch_analytics instead.
 6. **Report requests**: Gather all data first (Cypher -> Analytics), then
    call finish_with_report.
 7. **Spatial/map queries**: Ensure Cypher retrieves lat/lon coordinates, then call
@@ -48,10 +55,15 @@
    The plan ensures all necessary data is gathered before optimization runs.
    Ensure Cypher retrieves lat/lon coordinates (use f.lat, f.lon — NOT f.location)
    alongside supply/demand data for route map visualization.
-9. **Optimization follow-ups**: If the user asks a what-if question ("what if Farm A
-   closes?", "increase demand by 20%") and optimization results already exist in state,
-   prefix the task with "MODIFY_PREVIOUS: ". Example:
-   dispatch_optimization("MODIFY_PREVIOUS: Remove Farm A from the supply set.")
+9. **Optimization follow-ups (what-if)**: When optimization results already exist
+   and the user asks a what-if, prefer define_scenario + dispatch_scenario (see #5)
+   over re-running the optimization. Map the request to typed perturbations, e.g.
+   "demand +20%" -> scale_param(target="demand", factor=1.2);
+   "Processor X offline" -> remove_entity(selector={"name": "Processor X"});
+   "halve DC capacity" -> scale_capacity(target="capacity", factor=0.5);
+   structural changes ("require full procurement", "add a max-route-length limit")
+   -> structural(instruction="..."). For "which factor matters most" / "sensitivity"
+   / "tornado", use define_sweep + dispatch_sweep instead (varies each factor ±%).
 
 ## After Each Worker Returns
 

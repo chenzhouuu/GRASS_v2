@@ -11,7 +11,8 @@ Uses tool-calling to route tasks to workers:
 """
 
 import logging
-from typing import Any
+import uuid
+from typing import Any, Literal
 
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from pydantic import BaseModel, Field
@@ -88,6 +89,43 @@ class EmptyInput(BaseModel):
     pass
 
 
+class PerturbationInput(BaseModel):
+    """One typed what-if change against the baseline optimization."""
+    kind: Literal[
+        "scale_param", "set_param", "scale_capacity", "remove_entity", "structural"
+    ] = Field(description="Perturbation type.")
+    target: str = Field(default="", description="Numeric column/parameter to change (empty for remove_entity/structural).")
+    selector: dict = Field(default_factory=dict, description="Row filter, e.g. {'name': 'Processor X'}; empty = all rows.")
+    factor: float | None = Field(default=None, description="Multiplier for scale_param/scale_capacity (e.g. 1.2 = +20%).")
+    value: float | None = Field(default=None, description="Absolute value for set_param.")
+    instruction: str = Field(default="", description="Natural-language change for kind=structural (P3).")
+
+
+class DefineScenarioInput(BaseModel):
+    """Input schema for the define_scenario tool."""
+    name: str = Field(description="Short label, e.g. 'Demand +20%' or 'Processor X offline'.")
+    description: str = Field(default="", description="One-line natural-language description of the what-if.")
+    perturbations: list[PerturbationInput] = Field(
+        default_factory=list, description="Ordered list of typed changes against the baseline."
+    )
+
+
+class SweepFactorInput(BaseModel):
+    """One factor in a sensitivity sweep (varied low↔high while others held)."""
+    name: str = Field(description="Display label, e.g. 'Retailer demand'.")
+    target: str = Field(description="Numeric column/parameter to vary, e.g. 'demand'.")
+    low: float = Field(default=0.8, description="Low multiplier (e.g. 0.8 = -20%).")
+    high: float = Field(default=1.2, description="High multiplier (e.g. 1.2 = +20%).")
+    selector: dict = Field(default_factory=dict, description="Optional row filter; empty = all rows.")
+
+
+class DefineSweepInput(BaseModel):
+    """Input schema for the define_sweep tool (tornado sensitivity)."""
+    factors: list[SweepFactorInput] = Field(
+        default_factory=list, description="Factors to vary one-at-a-time around the baseline."
+    )
+
+
 # ── agent class ───────────────────────────────────────────────────
 
 class SupervisorAgent:
@@ -124,6 +162,8 @@ class SupervisorAgent:
             "generate_plan": self._generate_plan,
             "get_neo4j_schema": self._get_schema,
             "extract_geo_data": self._extract_geo_data,
+            "define_scenario": self._define_scenario,
+            "define_sweep": self._define_sweep,
         }
 
         # Handoff map: tool name -> worker node name
@@ -132,6 +172,8 @@ class SupervisorAgent:
             "dispatch_analytics": "Analytics",
             "dispatch_optimization": "Optimization",
             "finish_with_report": "Report",
+            "dispatch_scenario": "ScenarioRunner",
+            "dispatch_sweep": "ScenarioRunner",
         }
 
     def _build_tool_schemas(self) -> list:
@@ -203,6 +245,51 @@ class SupervisorAgent:
                 args_schema=DispatchInput,
             ),
             StructuredTool.from_function(
+                func=lambda name="", description="", perturbations=None: "",
+                name="define_scenario",
+                description=(
+                    "Define a what-if scenario against the EXISTING baseline "
+                    "optimization (requires a prior optimization in this session). "
+                    "Use for questions like 'what if demand rises 20%', 'what if "
+                    "Processor X goes offline', 'what if DC capacity is halved'. "
+                    "Express each change as a typed perturbation: scale_param "
+                    "(factor, e.g. demand x1.2), set_param (value), scale_capacity "
+                    "(factor), or remove_entity (selector). After defining, call "
+                    "dispatch_scenario to run it. Do NOT call dispatch_optimization "
+                    "for a what-if — reuse the baseline."
+                ),
+                args_schema=DefineScenarioInput,
+            ),
+            StructuredTool.from_function(
+                func=lambda: "Dispatching to Scenario Runner.",
+                name="dispatch_scenario",
+                description=(
+                    "Run the scenario defined by define_scenario: re-solve the "
+                    "baseline on perturbed data and produce a before/after "
+                    "comparison (KPI deltas, binding-constraint shift, waterfall). "
+                    "Call only after define_scenario."
+                ),
+                args_schema=EmptyInput,
+            ),
+            StructuredTool.from_function(
+                func=lambda factors=None: "",
+                name="define_sweep",
+                description=(
+                    "Define a one-factor sensitivity sweep against the baseline "
+                    "optimization. Use for 'which factor matters most', 'sensitivity "
+                    "analysis', or 'tornado'. Each factor is varied low↔high (e.g. "
+                    "±20%) while others stay fixed; the result is a tornado chart "
+                    "ranking each factor's objective impact. Then call dispatch_sweep."
+                ),
+                args_schema=DefineSweepInput,
+            ),
+            StructuredTool.from_function(
+                func=lambda: "Dispatching sensitivity sweep to Scenario Runner.",
+                name="dispatch_sweep",
+                description="Run the sweep defined by define_sweep and produce a tornado chart.",
+                args_schema=EmptyInput,
+            ),
+            StructuredTool.from_function(
                 func=lambda: "Dispatching to Report Agent for PDF generation.",
                 name="finish_with_report",
                 description=(
@@ -230,6 +317,8 @@ class SupervisorAgent:
             "state": state,
             "pending_plan": None,
             "pending_geo_data": None,
+            "pending_scenario": None,
+            "pending_sweep": None,
         }
         emitted_messages: list = []
 
@@ -329,6 +418,14 @@ class SupervisorAgent:
                 # If we extracted geo data, include it
                 if ctx["pending_geo_data"]:
                     state_update["geo_data"] = ctx["pending_geo_data"]
+
+                # If we defined a what-if scenario, carry it to the ScenarioRunner
+                if ctx["pending_scenario"]:
+                    state_update["pending_scenario"] = ctx["pending_scenario"]
+
+                # If we defined a sensitivity sweep, carry it to the ScenarioRunner
+                if ctx["pending_sweep"]:
+                    state_update["pending_sweep"] = ctx["pending_sweep"]
 
                 # If we generated a plan, include it in state
                 if ctx["pending_plan"]:
@@ -689,3 +786,85 @@ class SupervisorAgent:
         except Exception as exc:
             logger.error("extract_geo_data failed: %s", exc)
             return f"Geo data extraction failed: {exc}"
+
+    def _define_scenario(
+        self, ctx: dict, name: str = "", description: str = "", perturbations=None
+    ) -> str:
+        """Define a what-if scenario against the session's baseline optimization."""
+        from ..core.schemas import Perturbation, Scenario
+
+        baseline = ctx["state"].get("optimization_baseline")
+        if not baseline:
+            return (
+                "No baseline optimization exists yet in this session. Run an "
+                "optimization first (dispatch_optimization), then define the what-if."
+            )
+
+        perts: list[Perturbation] = []
+        for p in (perturbations or []):
+            try:
+                perts.append(Perturbation(**p) if isinstance(p, dict) else Perturbation(**dict(p)))
+            except Exception as exc:
+                return f"Invalid perturbation {p!r}: {exc}"
+        if not perts:
+            return (
+                "A what-if scenario needs at least one perturbation "
+                "(e.g. scale_param target='demand' factor=1.2)."
+            )
+
+        scenario = Scenario(
+            scenario_id=uuid.uuid4().hex[:8],
+            name=name or "What-if scenario",
+            baseline_id=baseline.get("run_id", ""),
+            description=description,
+            perturbations=perts,
+        )
+        ctx["pending_scenario"] = scenario.model_dump()
+
+        def _desc(p: Perturbation) -> str:
+            if p.kind in ("scale_param", "scale_capacity"):
+                return f"{p.kind} {p.target}×{p.factor}"
+            if p.kind == "set_param":
+                return f"set {p.target}={p.value}"
+            if p.kind == "remove_entity":
+                return f"remove {p.selector}"
+            return f"structural: {p.instruction[:40]}"
+
+        summary = "; ".join(_desc(p) for p in perts)
+        return (
+            f"Scenario '{scenario.name}' defined ({len(perts)} change(s): {summary}). "
+            f"Now call dispatch_scenario to run it against the baseline."
+        )
+
+    def _define_sweep(self, ctx: dict, factors=None) -> str:
+        """Define a one-factor sensitivity sweep against the session baseline."""
+        baseline = ctx["state"].get("optimization_baseline")
+        if not baseline:
+            return (
+                "No baseline optimization exists yet in this session. Run an "
+                "optimization first (dispatch_optimization), then define the sweep."
+            )
+        factors = factors or []
+        if not factors:
+            return (
+                "A sweep needs at least one factor "
+                "(e.g. {name:'Demand', target:'demand', low:0.8, high:1.2})."
+            )
+        norm: list[dict] = []
+        for f in factors:
+            f = f if isinstance(f, dict) else dict(f)
+            if not f.get("target"):
+                return f"Sweep factor missing 'target': {f!r}"
+            norm.append({
+                "name": f.get("name") or f["target"],
+                "target": f["target"],
+                "low": float(f.get("low", 0.8)),
+                "high": float(f.get("high", 1.2)),
+                "selector": f.get("selector", {}) or {},
+            })
+        ctx["pending_sweep"] = {"factors": norm}
+        names = ", ".join(f["name"] for f in norm)
+        return (
+            f"Sensitivity sweep defined over {len(norm)} factor(s): {names}. "
+            f"Now call dispatch_sweep to produce the tornado chart."
+        )

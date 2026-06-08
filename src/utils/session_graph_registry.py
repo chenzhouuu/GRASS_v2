@@ -14,6 +14,7 @@ from ..agents.executor_agent import ExecutorAgent
 from ..agents.optimization_agent import OptimizationAgent
 from ..agents.planner_agent import PlannerAgent
 from ..agents.report_agent import ReportAgent
+from ..agents.scenario_runner import ScenarioRunner
 from ..agents.supervisor_agent import SupervisorAgent
 from ..core.graph import build_graph
 from .model_loader import create_model, hash_session_model_config, has_runtime_api_keys
@@ -91,6 +92,9 @@ class SessionGraphRegistry:
         executor_agent = ExecutorAgent(
             model=create_model("executor_agent", session_config=session_config),
         )
+        scenario_runner = ScenarioRunner(
+            model=create_model("scenario_runner", session_config=session_config),
+        )
 
         return build_graph(
             supervisor_agent=supervisor_agent,
@@ -100,5 +104,6 @@ class SessionGraphRegistry:
             report_agent=report_agent,
             planner_agent=planner_agent,
             executor_agent=executor_agent,
+            scenario_runner=scenario_runner,
             checkpointer=self._checkpointer,
         )

@@ -26,6 +26,7 @@ BACKEND_TO_FRONTEND_AGENT = {
     "report_agent": "Report",
     "planner_agent": "Planner",
     "executor_agent": "Executor",
+    "scenario_runner": "ScenarioRunner",
 }
 FRONTEND_TO_BACKEND_AGENT = {
     frontend: backend for backend, frontend in BACKEND_TO_FRONTEND_AGENT.items()

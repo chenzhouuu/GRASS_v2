@@ -264,7 +264,7 @@ async def _emit_graph_events(
             continue
 
         if event_type == "on_chain_start" and name in [
-            "Supervisor", "Cypher", "Analytics", "Optimization", "Report"
+            "Supervisor", "Cypher", "Analytics", "Optimization", "Report", "ScenarioRunner"
         ]:
             step_counter += 1
             step_id = f"{run_id}:{step_counter}"
@@ -274,7 +274,7 @@ async def _emit_graph_events(
             })
 
         elif event_type == "on_chain_end" and name in [
-            "Supervisor", "Cypher", "Analytics", "Optimization", "Report"
+            "Supervisor", "Cypher", "Analytics", "Optimization", "Report", "ScenarioRunner"
         ]:
             output = data.get("output", {})
             step_id = active_step_ids.pop(name, None)
@@ -350,6 +350,20 @@ async def _emit_graph_events(
                     yield build_sse_event("report", {
                         "url": f"/api/files/{file_id}", "title": "Supply Chain Report",
                     })
+
+            elif name == "ScenarioRunner":
+                comparison = output.get("scenario_comparison")
+                if comparison:
+                    yield build_sse_event("scenario_comparison", comparison)
+                sc_charts = output.get("chart_specs") or []
+                for i, spec in enumerate(sc_charts):
+                    chart_id = str(uuid.uuid4())
+                    collected_chart_specs.append({"id": chart_id, "index": i, "spec": spec})
+                    yield build_sse_event("chart_spec", {"id": chart_id, "index": i, "spec": spec})
+                sc_geo = output.get("geo_data")
+                if sc_geo and sc_geo.get("features"):
+                    collected_geo_data = sc_geo
+                    yield build_sse_event("geo_data", {"geojson": sc_geo})
 
             yield build_sse_event("agent_complete", {
                 "agent": name, "status": "done", "step_id": step_id, "result": {},
