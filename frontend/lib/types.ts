@@ -88,6 +88,35 @@ export interface LedgerProgress {
   steps: LedgerProgressStep[];
 }
 
+// ─── What-if scenario comparison (SSE: scenario_comparison) ─────────────────
+
+export type GoodDirection = "up" | "down" | "flat";
+
+export interface KpiDelta {
+  name: string;
+  baseline: number;
+  scenario: number;
+  delta: number;
+  pct: number | null;
+  unit: string;
+  good_direction: GoodDirection;
+}
+
+export interface ScenarioComparison {
+  baseline_run_id: string;
+  scenario_run_id: string;
+  scenario_name: string;
+  scenario_description: string;
+  objective_sense: string;
+  objective_baseline: number | null;
+  objective_scenario: number | null;
+  kpi_deltas: KpiDelta[];
+  binding_added: string[];
+  binding_removed: string[];
+  waterfall: { data: Plotly.Data[]; layout?: Partial<Plotly.Layout> } | null;
+  narrative: string;
+}
+
 // ─── Chat messages ──────────────────────────────────────────────────────────
 
 export type MessageRole = "user" | "assistant";
@@ -111,6 +140,7 @@ export interface Message {
   attachments?: MessageAttachment[];
   visualizations?: VisualizationData[];
   mapData?: MapPayload;
+  scenarioComparison?: ScenarioComparison;
 }
 
 // ─── Cypher / Database (SSE: cypher_query) ──────────────────────────────────
@@ -329,4 +359,5 @@ export type SSEEvent =
   | { event: "plan_review"; data: PlanReviewPayload }
   | { event: "plan_pending"; data: { run_id: string } }
   | { event: "progress"; data: LedgerProgress }
+  | { event: "scenario_comparison"; data: ScenarioComparison }
   | { event: "done"; data: Record<string, never> };

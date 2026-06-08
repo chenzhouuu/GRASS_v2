@@ -8,6 +8,7 @@ import { AssistantMessage } from "./AssistantMessage";
 import { StreamingIndicator } from "./StreamingIndicator";
 import { PlanReviewCard } from "./PlanReviewCard";
 import { PlanExecutionTimeline } from "./PlanExecutionTimeline";
+import { ScenarioComparisonCard } from "./ScenarioComparisonCard";
 import { ChevronDown, BarChart3, Loader2 } from "lucide-react";
 
 interface MessageListProps {
@@ -93,6 +94,10 @@ export function MessageList({ onSendMessage }: MessageListProps) {
                       onSendMessage={onSendMessage}
                     />
                   )
+                )}
+
+                {isAssistant && message.scenarioComparison && (
+                  <ScenarioComparisonCard comparison={message.scenarioComparison} />
                 )}
 
                 {isAssistant && pendingReview?.assistantMessageId === message.id && (

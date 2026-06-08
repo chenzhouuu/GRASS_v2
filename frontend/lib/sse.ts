@@ -15,6 +15,7 @@ import type {
   NvlGraphResult,
   PipelineRun,
   PlanReviewPayload,
+  ScenarioComparison,
   StreamAgentName,
   VisualizationData,
 } from "@/lib/types";
@@ -316,6 +317,18 @@ function dispatch(
         ledgerProgress: progress,
       });
       useAgentStore.getState().recordEvent("progress");
+      break;
+    }
+
+    case "scenario_comparison": {
+      // What-if before/after: attach the comparison to the assistant message
+      // so the ScenarioComparisonCard renders (and persists on reload).
+      const comparison = data as ScenarioComparison;
+      useChatStore.getState().updateMessage(assistantMessageId, {
+        scenarioComparison: comparison,
+      });
+      useAppStore.getState().setTabBadge("charts", { type: "new" });
+      useAgentStore.getState().recordEvent("scenario_comparison");
       break;
     }
 
