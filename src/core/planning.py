@@ -27,8 +27,8 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger(__name__)
 
 # GRASS worker roster — the only valid agents for a plan step.
-GRASS_AGENTS = ("Cypher", "Analytics", "Optimization", "Report")
-AgentName = Literal["Cypher", "Analytics", "Optimization", "Report"]
+GRASS_AGENTS = ("Cypher", "Analytics", "Optimization", "Report", "ScenarioRunner")
+AgentName = Literal["Cypher", "Analytics", "Optimization", "Report", "ScenarioRunner"]
 
 _AGENT_LOOKUP = {a.lower(): a for a in GRASS_AGENTS}
 
