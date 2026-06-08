@@ -11,7 +11,7 @@ P3 (formulation editing). The before/after comparison + presentation is the
 ScenarioInterpreter's job (P2); here we emit a brief inline objective delta.
 
     runner = ScenarioRunner()
-    update = runner.invoke(state)   # needs state["optimization_baseline"] + state["pending_scenario"]
+    update = runner.invoke(state)   # needs "optimization_baseline"; "pending_scenario" optional (plan mode derives it from "worker_task")
 """
 
 import logging
@@ -36,7 +36,8 @@ logger = logging.getLogger(__name__)
 
 class ScenarioRunner:
     """Deterministic what-if re-solver. Reuses the Optimization agent's
-    post-solve builders; no LLM call in the P1 path."""
+    post-solve builders. The deterministic path makes no LLM call; plan-mode
+    scenario derivation (when ``pending_scenario`` is absent) calls the model once."""
 
     agent_name = "scenario_runner"
 
