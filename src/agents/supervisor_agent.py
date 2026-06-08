@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 
 from ..utils.prompt_assembler import PromptAssembler
 from ..utils.schema_loader import get_schema as load_schema_text
-from ..core.schemas import PlanOutput, PlanStep
+from ..core.schemas import PlanOutput
 from ..tools.geo_extractor import extract_geo_data as _extract_geo_data_fn
 
 logger = logging.getLogger(__name__)
@@ -470,7 +470,10 @@ class SupervisorAgent:
         # (e.g. an extra Cypher to backfill coordinates) and retries, which
         # the old `len(past_steps)` positional heuristic mis-counted —
         # skipping real steps or marking the plan complete prematurely.
-        plan = state.get("supervisor_plan")
+        # Prefer the co-planning Plan (mode="plan"); fall back to the legacy
+        # supervisor_plan. Both expose steps keyed by `agent`; the co-planning
+        # step carries title/details instead of `task`.
+        plan = state.get("plan") or state.get("supervisor_plan")
         if plan and plan.get("steps"):
             plan_steps = plan["steps"]
             executed = self._executed_worker_sequence(state.get("messages", []))
@@ -494,7 +497,12 @@ class SupervisorAgent:
             plan_lines = ["## Plan Progress (EXECUTE STEPS IN ORDER)"]
             for i, (step, done) in enumerate(zip(plan_steps, done_flags)):
                 step_agent = step.get("agent", "")
-                step_task = step.get("task", step.get("description", ""))
+                step_task = (
+                    step.get("task")
+                    or step.get("details")
+                    or step.get("title")
+                    or step.get("description", "")
+                )
                 mark = "[x]" if done else "[ ]"
                 suffix = " — DONE" if done else ""
                 plan_lines.append(
@@ -508,7 +516,12 @@ class SupervisorAgent:
             if next_idx is not None:
                 next_step = plan_steps[next_idx]
                 next_agent = next_step.get("agent", "?")
-                next_task = next_step.get("task", next_step.get("description", ""))
+                next_task = (
+                    next_step.get("task")
+                    or next_step.get("details")
+                    or next_step.get("title")
+                    or next_step.get("description", "")
+                )
                 plan_lines.append(
                     f"\n  >>> NEXT ACTION: dispatch_{next_agent.lower()}"
                     f"(\"{next_task[:120]}\")"

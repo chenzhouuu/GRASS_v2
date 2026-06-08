@@ -24,3 +24,13 @@ agents:
     model_config:
       model: gpt-5.4-mini
       temperature: 0
+  planner_agent:
+    provider: openai
+    model_config:
+      model: gpt-5.4-mini
+      temperature: 0
+  executor_agent:
+    provider: openai
+    model_config:
+      model: gpt-5.4-mini
+      temperature: 0

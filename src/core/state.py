@@ -8,6 +8,12 @@ each worker appends (task, result) tuples.
 Supervisor refactor (2026-03-08):
   Removed: intent, plan, current_step_index, completed_steps, response
   Added:   next_worker, worker_task, supervisor_plan
+
+Co-planning mode (2026-06-06):
+  Added:   mode, in_planning_mode, plan, plan_str, n_replans, plan_route,
+           replan_feedback. NOTE: ``plan`` here is the NEW co-planning
+           artifact (Plan.model_dump(), a Magentic-UI port), not the old
+           Plan/Process/Replanner DAG that was removed above.
 """
 
 import operator
@@ -29,9 +35,32 @@ class GRASSState(TypedDict):
     #    completed_steps, response) --------------------------------------
     next_worker: Optional[str]           # routing signal for supervisor_router
     worker_task: Optional[str]           # task description for dispatched worker
-    supervisor_plan: Optional[dict]      # plan from generate_plan tool (optional)
+    supervisor_plan: Optional[dict]      # plan from generate_plan tool (optional, legacy)
     requires_geo: bool
     requires_optimization: bool
+
+    # -- Co-planning mode (Magentic-UI co-planning port) -----------------
+    # ``mode``: "direct" = react loop only (default, == today's behavior);
+    #           "plan"   = cooperative planning with a human approval gate.
+    mode: Optional[str]
+    in_planning_mode: Optional[bool]     # planning phase vs execution phase
+    plan: Optional[dict]                 # approved/proposed Plan.model_dump()
+    plan_str: Optional[str]              # rendered plan text (Magentic plan_str)
+    n_replans: Optional[int]             # bounded replan counter
+    plan_route: Optional[str]            # transient router signal: gate/replan/execute/end
+    replan_feedback: Optional[str]       # human feedback carried into a replan
+
+    # -- Progress-ledger executor (Step 4) -------------------------------
+    # ``execution_engine``: "ledger" after a plan is approved in plan mode;
+    # workers then return to the Executor instead of the Supervisor.
+    execution_engine: Optional[str]
+    current_step_idx: Optional[int]      # index into ENABLED plan steps
+    n_rounds: Optional[int]              # ledger-turn counter (vs max_turns)
+    information_collected: Optional[str] # accumulated progress summaries
+    # Stall detection: signature of the worker results at the last ledger turn
+    # and how many consecutive dispatch turns have produced no new results.
+    last_progress_signature: Optional[str]
+    stall_rounds: Optional[int]
 
     # -- Evaluation (kept from Replanner) --------------------------------
     past_steps: Annotated[List[Tuple[str, str]], operator.add]

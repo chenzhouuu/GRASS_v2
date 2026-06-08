@@ -10,7 +10,9 @@ from typing import Any
 
 from ..agents.analytics_agent import AnalyticsAgent
 from ..agents.cypher_agent import CypherAgent
+from ..agents.executor_agent import ExecutorAgent
 from ..agents.optimization_agent import OptimizationAgent
+from ..agents.planner_agent import PlannerAgent
 from ..agents.report_agent import ReportAgent
 from ..agents.supervisor_agent import SupervisorAgent
 from ..core.graph import build_graph
@@ -82,6 +84,13 @@ class SessionGraphRegistry:
         report_agent = ReportAgent(
             model=create_model("report_agent", session_config=session_config)
         )
+        planner_agent = PlannerAgent(
+            model=create_model("planner_agent", session_config=session_config),
+            prompt_assembler=self._prompt_assembler,
+        )
+        executor_agent = ExecutorAgent(
+            model=create_model("executor_agent", session_config=session_config),
+        )
 
         return build_graph(
             supervisor_agent=supervisor_agent,
@@ -89,5 +98,7 @@ class SessionGraphRegistry:
             analytics_agent=analytics_agent,
             optimization_agent=optimization_agent,
             report_agent=report_agent,
+            planner_agent=planner_agent,
+            executor_agent=executor_agent,
             checkpointer=self._checkpointer,
         )

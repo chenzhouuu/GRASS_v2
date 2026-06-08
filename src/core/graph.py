@@ -14,7 +14,15 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import StateGraph, START, END
 
 from .state import GRASSState
-from .router import supervisor_router
+from .router import (
+    supervisor_router,
+    entry_router,
+    plan_draft_router,
+    plan_gate_router,
+    executor_router,
+    worker_return_router,
+    report_return_router,
+)
 from ..utils.tracing import configure_tracing
 
 logger = logging.getLogger(__name__)
@@ -63,6 +71,8 @@ def build_graph(
     optimization_agent=None,
     report_agent=None,
     checkpointer=None,
+    planner_agent=None,
+    executor_agent=None,
     *,
     tracing: bool | None = None,
     langsmith_project: str | None = None,
@@ -104,9 +114,57 @@ def build_graph(
         _wrap_agent(report_agent, "Report") if report_agent else _make_stub("Report"),
     )
 
+    # -- co-planning nodes (only when a Planner is wired) -------------
+    # When absent, the graph is identical to the react-only architecture
+    # (START -> Supervisor), so existing behavior and tests are unchanged.
+    if planner_agent is not None:
+        workflow.add_node("Planner", planner_agent.draft_node)
+        workflow.add_node("PlanGate", planner_agent.gate_node)
+        workflow.add_node("Replan", planner_agent.replan_node)
+
+    # Ledger execution requires BOTH a planner (the gate) and an executor.
+    ledger_enabled = planner_agent is not None and executor_agent is not None
+    if ledger_enabled:
+        workflow.add_node("Executor", executor_agent.ledger_node)
+        workflow.add_node("Finalize", executor_agent.finalize_node)
+
     # -- edges --------------------------------------------------------
     # Entry
-    workflow.add_edge(START, "Supervisor")
+    if planner_agent is not None:
+        # mode == "plan" -> Planner; else -> Supervisor (direct react).
+        workflow.add_conditional_edges(START, entry_router, {
+            "plan": "Planner",
+            "direct": "Supervisor",
+        })
+        # Planner draft -> human gate, or END (no plan / direct answer).
+        workflow.add_conditional_edges("Planner", plan_draft_router, {
+            "gate": "PlanGate",
+            "end": END,
+        })
+        # Human gate -> execute (accepted) or replan (rejected). In ledger mode
+        # an accepted plan runs through the progress-ledger Executor; otherwise
+        # it falls back to the Supervisor react loop (Steps 1-3 behavior).
+        workflow.add_conditional_edges("PlanGate", plan_gate_router, {
+            "execute": "Executor" if ledger_enabled else "Supervisor",
+            "replan": "Replan",
+        })
+        # Replan -> back to the gate.
+        workflow.add_edge("Replan", "PlanGate")
+    else:
+        workflow.add_edge(START, "Supervisor")
+
+    # -- progress-ledger executor edges -------------------------------
+    if ledger_enabled:
+        workflow.add_conditional_edges("Executor", executor_router, {
+            "Cypher": "Cypher",
+            "Analytics": "Analytics",
+            "Optimization": "Optimization",
+            "Report": "Report",
+            "Executor": "Executor",   # step completed -> re-evaluate next step
+            "Replan": "Replan",
+            "Finalize": "Finalize",
+        })
+        workflow.add_edge("Finalize", END)
 
     # Supervisor -> conditional routing
     workflow.add_conditional_edges("Supervisor", supervisor_router, {
@@ -117,11 +175,23 @@ def build_graph(
         END: END,
     })
 
-    # Workers -> Supervisor (return for evaluation)
-    for worker in ["Cypher", "Analytics", "Optimization"]:
-        workflow.add_edge(worker, "Supervisor")
-
-    # Terminal: Report -> END
-    workflow.add_edge("Report", END)
+    # Workers return for evaluation. With the ledger executor wired, the
+    # return target depends on execution_engine ("ledger" -> Executor, else
+    # Supervisor); otherwise it is statically the Supervisor (unchanged graph).
+    if ledger_enabled:
+        for worker in ["Cypher", "Analytics", "Optimization"]:
+            workflow.add_conditional_edges(worker, worker_return_router, {
+                "Supervisor": "Supervisor",
+                "Executor": "Executor",
+            })
+        # Report: terminal in react mode (END), a normal step in ledger mode.
+        workflow.add_conditional_edges("Report", report_return_router, {
+            "Executor": "Executor",
+            END: END,
+        })
+    else:
+        for worker in ["Cypher", "Analytics", "Optimization"]:
+            workflow.add_edge(worker, "Supervisor")
+        workflow.add_edge("Report", END)
 
     return workflow.compile(checkpointer=checkpointer or MemorySaver())
