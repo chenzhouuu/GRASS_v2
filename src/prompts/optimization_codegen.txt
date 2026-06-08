@@ -85,6 +85,16 @@ if is_lp:
 else:
     print("Note: Sensitivity analysis not available for MILP problems.")
 
+# KPIs, duals, and binding constraints — used by the what-if engine for
+# baseline/scenario comparison. duals/binding are LP-only (empty for MILP).
+kpis = {
+    "total_volume_lbs": round(sum(r["volume"] for r in routes), 1),
+    "total_route_cost": round(sum(r["cost"] for r in routes), 2),
+    "n_active_routes": len(routes),
+}
+duals = {s["constraint"]: s["shadow_price"] for s in sensitivity}
+binding = [s["constraint"] for s in sensitivity if abs(s.get("slack", 1.0)) < 1e-3]
+
 print(f"Status: {pulp.LpStatus[prob.status]}")
 print(f"Objective: ${pulp.value(prob.objective):,.2f}")
 for r in routes[:10]:
@@ -95,6 +105,9 @@ print(f"SOLUTION_JSON:" + json.dumps({
     "solver": "Gurobi" if shutil.which("gurobi_cl") else "CBC",
     "routes": routes[:50],
     "sensitivity": sensitivity[:20],
+    "kpis": kpis,
+    "duals": duals,
+    "binding": binding,
     "assumptions": ["$0.10/mile via haversine"],
 }, default=str))
 
@@ -204,6 +217,12 @@ print(f"SOLUTION_JSON:" + json.dumps({
     "solver": "WeightedCentroid",
     "routes": routes[:50],
     "sensitivity": [],
+    "kpis": {
+        "total_weighted_distance": round(total_weighted_dist, 2),
+        "n_supply_points": int(len(supply)),
+    },
+    "duals": {},
+    "binding": [],
     "assumptions": ["Weighted centroid minimizes sum of weighted squared distances",
                     f"Optimal location: ({opt_lat:.4f}, {opt_lon:.4f})"],
     "optimal_location": {"lat": round(opt_lat, 6), "lon": round(opt_lon, 6)},
@@ -264,6 +283,13 @@ demand_df = demand_df.dropna(axis=1, how='all')
 IMPORTANT: After splitting, use the REAL entity names from the `name` column
 in each DataFrame. Do NOT rename entities to generic labels like "Farm A" or "Processor 1".
 
+## CRITICAL: the model must move product (no degenerate $0 plan)
+A min-cost problem with only `<=` constraints ships nothing (objective 0). For
+ANY allocation/transportation problem, add a flow-forcing constraint:
+- supply <= capacity total → force full supply: `for i: lpSum(x[i,j] for j) == supply[i]`
+- otherwise → meet demand: `for j: lpSum(x[i,j] for i) >= demand[j]`
+Never produce a plan with objective 0 and no routes.
+
 ## Adapt the above pattern to your specific formulation. Key rules:
 1. Use INTEGER INDICES for PuLP variable names (0,1,2,...), NOT entity names
 2. Build entity DataFrames by selecting + deduplicating columns from joined Cypher results.
@@ -274,6 +300,9 @@ in each DataFrame. Do NOT rename entities to generic labels like "Farm A" or "Pr
 6. Wrap solver selection in shutil.which check
 7. Output SOLUTION_JSON: on a single line (no line breaks in the JSON)
 8. Use numeric_only=True for aggregation functions
+9. Always include `kpis` (dict of scalar metrics), `duals` (constraint name →
+   shadow price, LP only — empty {} for MILP), and `binding` (list of binding
+   constraint names) in SOLUTION_JSON. These drive the what-if comparison.
 
 ## Visualization Protocol (CRITICAL)
 After solving, create ONE or TWO Plotly charts that summarize the solution.

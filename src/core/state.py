@@ -93,6 +93,25 @@ class GRASSState(TypedDict):
     optimization_solution: Optional[dict]
     optimization_error: Optional[str]
 
+    # -- What-if scenario engine (P0) -----------------------------------
+    # Durable snapshot of the last successful structured optimization run
+    # (OptimizationRun.model_dump()): formulation + cached code + KPIs +
+    # duals + binding constraints. A later scenario perturbs this baseline's
+    # data and re-runs its cached code. One baseline per session.
+    optimization_baseline: Optional[dict]
+    # Scenario the Supervisor/Planner asked the ScenarioRunner to run
+    # (Scenario.model_dump()); consumed by the ScenarioRunner.
+    pending_scenario: Optional[dict]
+    # One-factor sensitivity sweep request: {"factors": [{name,target,low,high,selector?}]}.
+    # Consumed by ScenarioRunner.run_sweep → tornado chart.
+    pending_sweep: Optional[dict]
+    # Accumulated scenario run snapshots (OptimizationRun.model_dump()).
+    scenario_runs: Annotated[List[dict], operator.add]
+    # Latest baseline-vs-scenario comparison (ScenarioComparison.model_dump()):
+    # KPI deltas + binding shift + objective waterfall + narrative. Drives the
+    # frontend ScenarioComparisonCard.
+    scenario_comparison: Optional[dict]
+
     # -- Report Agent output --------------------------------------------
     report_file: Optional[str]
 

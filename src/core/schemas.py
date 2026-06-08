@@ -122,3 +122,128 @@ class OptimizationFormulation(BaseModel):
     constraints: list[OptConstraint] = Field(default_factory=list, description="Model constraints.")
     assumptions: list[str] = Field(default_factory=list, description="Assumptions made.")
     data_reduction: str = Field(default="", description="Strategy for handling large data.")
+
+
+# ── What-if scenario engine — solved-instance snapshot (P0) ─────────
+
+
+class KPI(BaseModel):
+    """A single normalized key performance indicator extracted from a solution."""
+    name: str = Field(description="KPI identifier, e.g. 'total_route_cost'.")
+    value: float = Field(description="Scalar value.")
+    unit: str = Field(default="", description="Display unit, e.g. '$', 'lbs'.")
+
+
+class OptimizationRun(BaseModel):
+    """A solved optimization instance snapshot — the unit of what-if comparison.
+
+    The baseline run is persisted in state as ``optimization_baseline`` so a
+    later scenario can perturb its data and re-run the cached ``code`` without
+    re-formulating (OptiMUS-style model/data separation).
+    """
+    run_id: str = Field(description="Unique id for this solved instance.")
+    scenario_id: str | None = Field(
+        default=None, description="None for the baseline run; set for scenario runs."
+    )
+    formulation: OptimizationFormulation = Field(description="The structured model that was solved.")
+    code: str = Field(default="", description="Generated PuLP code (cached for scenario re-solve).")
+    status: str = Field(default="", description="Solver status, e.g. 'Optimal'.")
+    objective: float | None = Field(default=None, description="Objective value if solved.")
+    kpis: list[KPI] = Field(default_factory=list, description="Normalized KPIs.")
+    duals: dict = Field(
+        default_factory=dict, description="Constraint name → shadow price (LP only)."
+    )
+    binding_constraints: list[str] = Field(
+        default_factory=list, description="Names of binding (zero-slack) constraints."
+    )
+    routes: list[dict] = Field(default_factory=list, description="Solution routes/flows.")
+    input_data: list[dict] = Field(
+        default_factory=list,
+        description="Rows the model solved on (baseline only) — perturbed by scenarios.",
+    )
+
+
+# ── What-if scenario engine — scenario definition (P1) ──────────────
+
+
+class Perturbation(BaseModel):
+    """One typed change against the baseline.
+
+    All kinds except ``structural`` are applied deterministically to the
+    baseline's data rows (no LLM). ``structural`` (add/relax a constraint or
+    bound) is deferred to P3 and applied by editing the formulation.
+    """
+    kind: Literal[
+        "scale_param",     # multiply a numeric column by ``factor`` (demand ×1.2)
+        "set_param",       # set a numeric column to absolute ``value``
+        "scale_capacity",  # scale a capacity column by ``factor`` (mechanically == scale_param)
+        "remove_entity",   # drop rows matching ``selector`` (Processor X offline)
+        "structural",      # constraint/bound change applied via the formulation (P3)
+    ] = Field(description="Perturbation type.")
+    target: str = Field(
+        default="",
+        description="Column/parameter this applies to (empty for remove_entity / structural).",
+    )
+    selector: dict = Field(
+        default_factory=dict,
+        description="Row filter, e.g. {'name': 'Processor X'}; empty = all rows.",
+    )
+    factor: float | None = Field(default=None, description="Multiplier for scale_* kinds.")
+    value: float | None = Field(default=None, description="Absolute value for set_param.")
+    instruction: str = Field(default="", description="NL instruction for kind=structural.")
+
+
+class Scenario(BaseModel):
+    """A named what-if = a diff against a baseline + the comparison spec.
+
+    Fully reproducible from its recipe (``baseline_id`` + ordered
+    ``perturbations``), mirroring mpi-sppy's ``(name, kwargs)`` contract.
+    """
+    scenario_id: str = Field(description="Unique id for this scenario.")
+    name: str = Field(description="Short human label, e.g. 'Processor X offline'.")
+    baseline_id: str = Field(default="", description="run_id of the baseline this perturbs.")
+    description: str = Field(default="", description="NL description for display/provenance.")
+    perturbations: list[Perturbation] = Field(default_factory=list)
+    requested_kpis: list[str] = Field(
+        default_factory=list, description="KPIs to compare in the report (P2)."
+    )
+
+
+# ── What-if scenario engine — before/after comparison (P2) ──────────
+
+
+class KpiDelta(BaseModel):
+    """One KPI's baseline→scenario change, with direction-aware coloring hint."""
+    name: str
+    baseline: float
+    scenario: float
+    delta: float
+    pct: float | None = Field(default=None, description="Percent change; None if baseline is 0.")
+    unit: str = ""
+    good_direction: Literal["up", "down", "flat"] = Field(
+        default="flat",
+        description="Which direction is favorable (drives green/red in the UI).",
+    )
+
+
+class ScenarioComparison(BaseModel):
+    """Baseline-vs-scenario comparison produced by the interpreter (deterministic
+    deltas + binding-constraint shift + objective waterfall + narrative)."""
+    baseline_run_id: str
+    scenario_run_id: str
+    scenario_name: str = ""
+    scenario_description: str = ""
+    objective_sense: str = "minimize"
+    objective_baseline: float | None = None
+    objective_scenario: float | None = None
+    kpi_deltas: list[KpiDelta] = Field(default_factory=list)
+    binding_added: list[str] = Field(
+        default_factory=list, description="Constraints newly binding in the scenario."
+    )
+    binding_removed: list[str] = Field(
+        default_factory=list, description="Constraints no longer binding in the scenario."
+    )
+    waterfall: dict | None = Field(
+        default=None, description="Plotly waterfall spec: baseline → Δ → scenario."
+    )
+    narrative: str = Field(default="", description="Model- or rule-generated 'why' explanation.")

@@ -27,6 +27,20 @@ visualized on the map. If the data lacks coordinates, note this in assumptions.
 - If >500 total entities: filter to top N by volume in region of interest
 - Always state data reduction strategy in the assumptions field
 
+## CRITICAL: avoid degenerate min-cost models (must move product)
+A minimize-cost transportation/allocation problem with ONLY upper-bound (<=)
+constraints is degenerate: shipping nothing costs $0 and is "optimal". This is
+WRONG for supply-chain allocation — the product must actually move. ALWAYS add a
+flow-forcing constraint:
+- If total supply <= total capacity: require each supply node to be FULLY
+  allocated — for each i: sum_j x[i,j] == supply[i].
+- Otherwise (supply exceeds capacity): require each demand/intake node to be met —
+  for each j: sum_i x[i,j] >= demand[j], and maximize allocated volume or report
+  unmet supply.
+Do NOT default to all-<= "and report unmet supply" — that yields a $0 no-op plan.
+Every allocation/transportation formulation MUST contain at least one == or >=
+constraint that forces flow.
+
 ## Parameter Source Types
 Use these source_type values:
 - "column": source_value is an exact column name from the data

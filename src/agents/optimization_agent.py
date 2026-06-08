@@ -20,11 +20,12 @@ Design informed by:
 import json
 import logging
 import re
+import uuid
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-from ..core.schemas import OptimizationFormulation
+from ..core.schemas import KPI, OptimizationFormulation, OptimizationRun
 from ..tools.python_executor import execute_python, persist_cypher_results
 from ..utils.data_summarizer import summarize_data, format_summary_for_prompt, make_data_preview
 from ..utils.prompt_loader import load_prompt
@@ -113,7 +114,7 @@ def _build_sankey_from_solution(solution: dict) -> dict | None:
                 "target": target,
                 "value": value,
                 "color": [
-                    f"rgba(22, 163, 74, 0.35)"  # semi-transparent green
+                    "rgba(22, 163, 74, 0.35)"  # semi-transparent green
                     for _ in source
                 ],
             },
@@ -295,6 +296,50 @@ def _extract_solution_json(output: str) -> dict | None:
     return None
 
 
+def _is_degenerate_output(output: str | None) -> bool:
+    """True when stdout holds an Optimal solution that shipped nothing (objective 0,
+    no routes) — the signature of an under-constrained min-cost LP."""
+    sol = _extract_solution_json(output or "")
+    if not sol:
+        return False
+    status = str(sol.get("status", "")).lower()
+    return status.startswith("optimal") and not (sol.get("routes") or []) and not sol.get("objective")
+
+
+# Corrective injected when a solve comes back degenerate (solution-level, robust).
+_DEGENERATE_CORRECTION = (
+    "The model returned objective 0 with NO allocations — it is DEGENERATE. You used "
+    "only upper-bound (<=) constraints, so shipping/allocating nothing is trivially "
+    "optimal. Fix it with a flow-forcing constraint that is GUARANTEED FEASIBLE: require "
+    "each processor to receive AT LEAST its CURRENT contracted intake = sum of the "
+    "existing SUPPLIES_RAW_MILK volume_lbs_month into it (for each j: sum_i x[i,j] >= "
+    "demand[j], where demand[j] is that current intake). Keep <= cooperative supply and "
+    "<= processor capacity (processing_capacity_lbs_day*30) as bounds. The current edge "
+    "volumes are a feasible point, so this MUST be feasible. Regenerate and execute again."
+)
+
+# Corrective injected when the solve is INFEASIBLE (usually an over-tight flow constraint
+# or an annual-vs-monthly units mismatch).
+_INFEASIBLE_CORRECTION = (
+    "The model is INFEASIBLE — your flow constraint over-constrains it. Do NOT force FULL "
+    "cooperative supply (sum_j x[i,j] == supply[i]); total monthly supply often exceeds "
+    "reachable capacity (watch annual-vs-monthly units — divide annual figures by 12). "
+    "Instead: (a) cap each cooperative outflow at its MONTHLY supply, (b) cap each "
+    "processor inflow at processing_capacity_lbs_day*30, (c) require each processor to "
+    "receive AT LEAST its CURRENT contracted intake (sum of existing SUPPLIES_RAW_MILK "
+    "volume_lbs_month into it) — always feasible — and minimize hauling cost. Regenerate "
+    "and execute again."
+)
+
+
+def _is_infeasible_output(output: str | None) -> bool:
+    """True when the parsed solution reports an infeasible/unbounded status."""
+    sol = _extract_solution_json(output or "")
+    if not sol:
+        return False
+    return str(sol.get("status", "")).lower().startswith(("infeasible", "unbounded"))
+
+
 def _extract_json_from_text(text: str) -> dict:
     """Extract JSON object from LLM text response (fallback for structured output)."""
     # Try parsing the whole thing
@@ -356,6 +401,49 @@ def _coerce_formulation_json(d: dict) -> dict:
     normaliser fills defaults and renames common aliases so that
     ``model_validate`` can succeed.
     """
+    # Unwrap a single top-level wrapper key (e.g. {"optimization_formulation": {...}}).
+    for wrapper in ("optimization_formulation", "formulation", "OptimizationFormulation"):
+        if isinstance(d.get(wrapper), dict) and len(d) == 1:
+            d = dict(d[wrapper])
+            break
+
+    # Aliases: 'type' -> problem_type, 'decision_variables' -> variables.
+    if "problem_type" not in d and isinstance(d.get("type"), str):
+        d["problem_type"] = d.pop("type")
+    if "variables" not in d and "decision_variables" in d:
+        d["variables"] = d.pop("decision_variables")
+
+    # Map a free-form problem_type onto the allowed enum.
+    _allowed_pt = {"transportation", "facility_location", "inventory", "assignment", "routing", "blending", "custom"}
+    pt = str(d.get("problem_type", "custom")).lower()
+    if pt not in _allowed_pt:
+        d["problem_type"] = (
+            "transportation" if "transport" in pt
+            else "facility_location" if ("facility" in pt or "location" in pt)
+            else "assignment" if "assign" in pt
+            else "custom"
+        )
+
+    # sets/parameters/variables sometimes arrive as a LIST of {name, ...} objects.
+    for section in ("sets", "parameters", "variables"):
+        val = d.get(section)
+        if isinstance(val, list):
+            as_dict: dict = {}
+            for i, item in enumerate(val):
+                if isinstance(item, dict):
+                    key = item.get("name") or item.get("symbol") or f"{section[:-1]}_{i}"
+                    item = {k: v for k, v in item.items() if k not in ("name", "symbol")}
+                    as_dict[str(key)] = item
+            d[section] = as_dict
+
+    # assumptions as a list of dicts -> list of strings.
+    if isinstance(d.get("assumptions"), list):
+        d["assumptions"] = [
+            a if isinstance(a, str)
+            else str(a.get("item") or a.get("name") or a.get("source_value") or json.dumps(a, default=str))
+            for a in d["assumptions"]
+        ]
+
     d.setdefault("problem_type", "custom")
     d.setdefault("description", "Optimization problem")
     d.setdefault("sets", {})
@@ -378,10 +466,15 @@ def _coerce_formulation_json(d: dict) -> dict:
 
     # Coerce nested dicts: sets, parameters, variables
     # LLM often uses 'description' instead of 'definition'
+    _allowed_src = {"column", "computed", "constant", "estimated"}
     for section in ("sets", "parameters", "variables"):
         items = d.get(section)
         if isinstance(items, dict):
-            for key, val in items.items():
+            for key, val in list(items.items()):
+                # A value given as a list (e.g. ['name', 'description']) -> dict.
+                if isinstance(val, list):
+                    val = {"definition": " ".join(str(x) for x in val)}
+                    items[key] = val
                 if isinstance(val, dict):
                     # description → definition
                     if "definition" not in val and "description" in val:
@@ -390,9 +483,10 @@ def _coerce_formulation_json(d: dict) -> dict:
                     # sets need size_from
                     if section == "sets":
                         val.setdefault("size_from", val.get("source_value", "unknown"))
-                    # parameters need source_type + source_value
+                    # parameters need a VALID source_type + source_value
                     if section == "parameters":
-                        val.setdefault("source_type", "estimated")
+                        if val.get("source_type") not in _allowed_src:
+                            val["source_type"] = "estimated"
                         val.setdefault("source_value", val.get("definition", ""))
                     # variables need type + bounds (string)
                     if section == "variables":
@@ -437,6 +531,98 @@ def _classify_opt_error(error: str, formulation: OptimizationFormulation | None)
     if "modulenotfounderror" in e:
         return "Use only: pulp, pandas, numpy, math, json, shutil."
     return "Review the traceback and fix the issue."
+
+
+# ── What-if baseline snapshot builders (deterministic, no LLM) ───────
+
+
+_BINDING_SLACK_EPS = 1e-3
+
+
+def _derive_kpis(solution: dict) -> list[dict]:
+    """Derive normalized KPIs from a solution dict (deterministic).
+
+    Combines structural KPIs (objective, total volume/cost, route count)
+    with any explicit ``kpis`` dict the generated code emitted. Explicit
+    values take precedence over derived ones of the same name.
+    """
+    kpis: dict[str, dict] = {}
+
+    obj = solution.get("objective")
+    if isinstance(obj, (int, float)):
+        kpis["objective_value"] = {"name": "objective_value", "value": float(obj), "unit": ""}
+
+    routes = solution.get("routes") or []
+    if routes:
+        total_vol = sum(r.get("volume", 0) or 0 for r in routes)
+        total_cost = sum(r.get("cost", 0) or 0 for r in routes)
+        kpis["total_volume"] = {"name": "total_volume", "value": float(total_vol), "unit": "lbs"}
+        kpis["total_route_cost"] = {"name": "total_route_cost", "value": float(total_cost), "unit": "$"}
+        kpis["n_active_routes"] = {"name": "n_active_routes", "value": float(len(routes)), "unit": ""}
+
+    explicit = solution.get("kpis")
+    if isinstance(explicit, dict):
+        for key, val in explicit.items():
+            if isinstance(val, (int, float)):
+                kpis[str(key)] = {"name": str(key), "value": float(val), "unit": ""}
+
+    return list(kpis.values())
+
+
+def _extract_duals(solution: dict) -> dict:
+    """Constraint name → shadow price. Prefer explicit ``duals``, else derive from ``sensitivity``."""
+    duals = solution.get("duals")
+    if isinstance(duals, dict) and duals:
+        return {str(k): float(v) for k, v in duals.items() if isinstance(v, (int, float))}
+    out: dict[str, float] = {}
+    for s in solution.get("sensitivity") or []:
+        if isinstance(s, dict) and "constraint" in s and isinstance(s.get("shadow_price"), (int, float)):
+            out[str(s["constraint"])] = float(s["shadow_price"])
+    return out
+
+
+def _extract_binding(solution: dict) -> list[str]:
+    """Binding constraint names. Prefer explicit ``binding``, else slack≈0 in ``sensitivity``."""
+    binding = solution.get("binding")
+    if isinstance(binding, list) and binding:
+        return [str(b) for b in binding]
+    out: list[str] = []
+    for s in solution.get("sensitivity") or []:
+        if isinstance(s, dict) and "constraint" in s:
+            slack = s.get("slack")
+            if isinstance(slack, (int, float)) and abs(slack) <= _BINDING_SLACK_EPS:
+                out.append(str(s["constraint"]))
+    return out
+
+
+def build_optimization_run(
+    formulation: OptimizationFormulation,
+    code: str,
+    solution: dict | None,
+    scenario_id: str | None = None,
+    run_id: str | None = None,
+    input_data: list[dict] | None = None,
+) -> OptimizationRun:
+    """Assemble an OptimizationRun snapshot from a formulation + solution (deterministic).
+
+    The baseline run caches ``code`` and ``input_data`` so a later scenario can
+    re-solve on perturbed data without re-formulating.
+    """
+    sol = solution or {}
+    obj = sol.get("objective")
+    return OptimizationRun(
+        run_id=run_id or uuid.uuid4().hex[:8],
+        scenario_id=scenario_id,
+        formulation=formulation,
+        code=code or "",
+        status=str(sol.get("status", "")),
+        objective=float(obj) if isinstance(obj, (int, float)) else None,
+        kpis=[KPI(**k) for k in _derive_kpis(sol)],
+        duals=_extract_duals(sol),
+        binding_constraints=_extract_binding(sol),
+        routes=sol.get("routes") or [],
+        input_data=input_data or [],
+    )
 
 
 # ── Agent class ──────────────────────────────────────────────────────
@@ -523,7 +709,7 @@ class OptimizationAgent:
             if attempt < MAX_FORMULATION_RETRIES:
                 messages.append(AIMessage(content=formulation.model_dump_json(indent=2)))
                 messages.append(HumanMessage(content=(
-                    f"Validation found issues:\n" + "\n".join(f"- {i}" for i in issues) +
+                    "Validation found issues:\n" + "\n".join(f"- {i}" for i in issues) +
                     "\n\nFix these issues and produce an updated formulation."
                 )))
 
@@ -591,6 +777,39 @@ class OptimizationAgent:
                     f"full aggregation. Original data has {total_rows} rows."
                 )
 
+        # Degenerate min-cost guard: a MINIMIZE problem whose constraints are ALL
+        # upper bounds (<=) has a trivial zero-flow optimum (ship/allocate nothing
+        # → cost 0). Require a flow-forcing constraint (supply fully allocated or
+        # demand met). This is the #1 cause of a "$0, no routes" solution.
+        if (
+            formulation.objective
+            and formulation.objective.sense == "minimize"
+            and formulation.variables
+            and formulation.constraints
+            and not is_facility_location
+        ):
+            exprs = " ".join((c.expression or "") for c in formulation.constraints)
+            stripped = exprs.replace("<=", "").replace(">=", "").replace("=<", "").replace("=>", "")
+            has_forcing = (
+                ">=" in exprs
+                or "≥" in exprs           # ≥
+                or "=>" in exprs
+                or "=" in stripped              # a bare equality constraint
+                or any(w in exprs.lower() for w in (
+                    "at least", "exactly", "fully", "meet demand", "satisfy",
+                    "all supply", "balance", "equal",
+                ))
+            )
+            if not has_forcing:
+                issues.append(
+                    "Degenerate min-cost model: every constraint is an upper bound (<=), "
+                    "so allocating NOTHING is trivially optimal (objective 0, no routes). "
+                    "Add a flow-forcing constraint — require each supply node to be fully "
+                    "allocated (for each i: sum_j x[i,j] == supply[i]) OR each processor's "
+                    "intake/demand to be met (for each j: sum_i x[i,j] >= demand[j]). "
+                    "Re-formulate WITH that constraint."
+                )
+
         return issues
 
     def _modify_formulation(
@@ -610,6 +829,35 @@ class OptimizationAgent:
             )),
         ]
         return self._formulate(messages)
+
+    def resolve_structural_scenario(
+        self,
+        base_formulation: dict,
+        instruction: str,
+        user_query: str,
+        perturbed_rows: list[dict],
+    ) -> dict[str, Any]:
+        """Re-solve a what-if that structurally edits the baseline formulation (P3).
+
+        Applies an LLM edit to the baseline formulation (add/relax a constraint or
+        bound), regenerates PuLP code, and executes it on the (already
+        deterministically-perturbed) data. Returns the modified formulation, the
+        regenerated code, and the parsed solution.
+        """
+        persist_cypher_results(perturbed_rows)
+        base = OptimizationFormulation.model_validate(base_formulation)
+        formulation = self._modify_formulation(base, instruction)
+        data_preview = make_data_preview(perturbed_rows, max_rows=3)
+        code_result = self._run_stage3(formulation, data_preview, user_query)
+        output = code_result.get("last_output") or ""
+        error = code_result.get("last_error")
+        solution = _extract_solution_json(output) if not error else None
+        return {
+            "formulation": formulation,
+            "code": code_result.get("last_code") or "",
+            "solution": solution,
+            "error": error,
+        }
 
     def _run_stage3(
         self, formulation: OptimizationFormulation, data_preview: str, user_query: str,
@@ -637,6 +885,7 @@ class OptimizationAgent:
         last_output: str | None = None
         last_error: str | None = None
         failed_attempts = 0
+        degenerate_retries = 0
 
         for _ in range(6):
             ai_msg = self.model.invoke(messages)
@@ -669,6 +918,19 @@ class OptimizationAgent:
                     f"Code execution failed:\n{last_error}\n\nHint: {hint}\n\n"
                     f"Attempt {failed_attempts} of {MAX_RETRIES + 1}. Fix and retry."
                 )))
+            elif degenerate_retries < MAX_RETRIES and (
+                _is_degenerate_output(last_output) or _is_infeasible_output(last_output)
+            ):
+                # Solution-level self-correction: $0/no-routes ⇒ add flow-forcing
+                # constraint; infeasible ⇒ relax to a feasible demand floor. Robust
+                # (triggers on the actual result, not on constraint text).
+                degenerate_retries += 1
+                degenerate = _is_degenerate_output(last_output)
+                logger.warning("Stage 3: %s solution, injecting correction (%d)",
+                               "degenerate" if degenerate else "infeasible", degenerate_retries)
+                messages.append(HumanMessage(
+                    content=_DEGENERATE_CORRECTION if degenerate else _INFEASIBLE_CORRECTION
+                ))
 
         # Force summary if needed
         if messages[-1].type != "ai" or messages[-1].tool_calls:
@@ -731,6 +993,17 @@ class OptimizationAgent:
             "sender": self.agent_name,
         }
 
+        # Persist the session baseline snapshot (formulation + cached code +
+        # input data + KPIs/duals/binding) so a later what-if scenario can
+        # perturb its data and re-run the cached code without re-formulating.
+        if solution and not error:
+            baseline_data = state.get("all_query_results") or state.get("cypher_results") or []
+            baseline_run = build_optimization_run(
+                formulation, code_result.get("last_code") or "", solution,
+                input_data=baseline_data,
+            )
+            result["optimization_baseline"] = baseline_run.model_dump()
+
         if chart_specs:
             result["chart_specs"] = chart_specs
         if geo_data:
@@ -767,6 +1040,22 @@ class OptimizationAgent:
 
         feedback = []
         cypher_results = state.get("cypher_results") or []
+
+        # Check 0: degenerate zero-flow solution (under-constrained min-cost LP)
+        status = str(solution.get("status", "")).lower()
+        routes0 = solution.get("routes") or []
+        obj0 = solution.get("objective")
+        if status.startswith("optimal") and not routes0 and not obj0:
+            feedback.append({
+                "type": "degenerate_solution",
+                "agent": "Optimization",
+                "message": (
+                    "The LP solved to objective 0 with no allocations — the model is "
+                    "under-constrained (no flow-forcing constraint). Re-dispatch "
+                    "optimization and require supply to be fully allocated or demand "
+                    "to be met (>=/== constraint), not just upper-bound (<=) capacities."
+                ),
+            })
 
         # Check 1: Objective magnitude vs input cost total
         cost_cols = {"transport_cost", "cost", "total_cost", "shipping_cost"}
@@ -873,6 +1162,7 @@ class OptimizationAgent:
         last_output: str | None = None
         last_error: str | None = None
         failed = 0
+        degenerate_retries = 0
 
         for _ in range(6):
             ai_msg = self.model.invoke(messages)
@@ -891,6 +1181,14 @@ class OptimizationAgent:
                 if failed > MAX_RETRIES:
                     break
                 messages.append(HumanMessage(content=f"Error:\n{last_error}\nFix and retry."))
+            elif degenerate_retries < MAX_RETRIES and (
+                _is_degenerate_output(last_output) or _is_infeasible_output(last_output)
+            ):
+                degenerate_retries += 1
+                messages.append(HumanMessage(
+                    content=_DEGENERATE_CORRECTION if _is_degenerate_output(last_output)
+                    else _INFEASIBLE_CORRECTION
+                ))
 
         if messages[-1].type != "ai" or messages[-1].tool_calls:
             messages.append(HumanMessage(content="Summarize the results."))
