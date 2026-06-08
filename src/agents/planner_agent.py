@@ -54,7 +54,11 @@ _TEAM_DESCRIPTION = """\
 - Optimization: LP/MILP optimization via PuLP (transport cost minimization,
   facility location, inventory/production planning).
 - Report: Generates a PDF report (fpdf2). Use only after all data gathering
-  and analysis are complete."""
+  and analysis are complete.
+- ScenarioRunner: Perturbs a previously established optimization baseline to
+  evaluate what-if / sensitivity scenarios (e.g. a facility going offline,
+  capacity changes, demand shocks). Always preceded in the same plan by an
+  Optimization step that establishes the baseline."""
 
 # Ported from get_orchestrator_plan_prompt_json (non-sentinel branch); the
 # free-form ``agent_name`` is constrained to the GRASS roster.
@@ -68,7 +72,7 @@ First consider:
 
 Each step has: a "title" (one short sentence), "details" (recap the title in one
 sentence, then a newline, then the concrete action — at most ~2 sentences), and
-"agent" (exactly one of: Cypher, Analytics, Optimization, Report).
+"agent" (exactly one of: Cypher, Analytics, Optimization, Report, ScenarioRunner).
 
 Each step must be a SINGLE concrete action achievable in ONE worker invocation.
 A worker runs one query/analysis per dispatch, so do NOT bundle two distinct
@@ -77,6 +81,14 @@ counts) AND a relationship/path extraction (e.g. farm→cooperative→processor 
 make them two separate Cypher steps. Aim for the fewest steps that still keeps each
 step atomic. Data must be retrieved (Cypher) before it can be analyzed, optimized,
 or reported.
+
+For a WHAT-IF question ("what if X changed", "re-run if a plant goes offline",
+"how sensitive is the plan to +-X%"), add a step with "agent": "ScenarioRunner".
+A ScenarioRunner step MUST be preceded, in the same plan, by an "Optimization"
+step that establishes the baseline it perturbs (and the Cypher step that fetches
+that baseline's data). Put the what-if change in the step "details" in plain
+language (e.g. "Philadelphia Dairy Processing P0042 limited to 2/3 capacity");
+ScenarioRunner converts it into the concrete perturbation.
 
 Output PURE JSON, parsable as-is, with no surrounding text, matching this schema:
 
