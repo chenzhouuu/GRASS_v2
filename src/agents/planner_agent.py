@@ -83,13 +83,25 @@ make them two separate Cypher steps. Aim for the fewest steps that still keeps e
 step atomic. Data must be retrieved (Cypher) before it can be analyzed, optimized,
 or reported.
 
+Before an "Optimization" step, the Cypher steps must retrieve RELATIONSHIP-LEVEL
+flow data, not entity aggregates alone: match the existing contract relationships
+(e.g. (c:Cooperative)-[s:SUPPLIES_RAW_MILK]->(p:Processor)) and return entity
+ids/names plus per-route properties (s.volume_lbs_month, transport cost), along
+with entity capacities. An assignment/flow model cannot be formulated without
+per-route volumes.
+
 For a WHAT-IF question ("what if X changed", "re-run if a plant goes offline",
 "how sensitive is the plan to +-X%"), add a step with "agent": "ScenarioRunner".
-A ScenarioRunner step MUST be preceded, in the same plan, by an "Optimization"
-step that establishes the baseline it perturbs (and the Cypher step that fetches
-that baseline's data). Put the what-if change in the step "details" in plain
-language (e.g. "Philadelphia Dairy Processing P0042 limited to 2/3 capacity");
-ScenarioRunner converts it into the concrete perturbation.
+Put the what-if change in the step "details" in plain language (e.g.
+"Philadelphia Dairy Processing P0042 limited to 2/3 capacity"); ScenarioRunner
+converts it into the concrete change. Two cases:
+- STRUCTURAL what-ifs (entity outage/closure, "which farms are stranded if X
+  closes?", cascade/reachability questions): the ScenarioRunner step needs NO
+  preceding Optimization step — it analyzes the network graph directly.
+- NUMERIC what-ifs (cost/demand/capacity percentages, objective impact): the
+  ScenarioRunner step MUST be preceded, in the same plan, by an "Optimization"
+  step that establishes the baseline it perturbs (and the Cypher step that
+  fetches that baseline's data).
 
 Output PURE JSON, parsable as-is, with no surrounding text, matching this schema:
 

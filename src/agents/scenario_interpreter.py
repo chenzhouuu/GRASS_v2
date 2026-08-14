@@ -241,6 +241,87 @@ def build_comparison(
     return comp
 
 
+# ── structural (Layer 1) comparison ──────────────────────────────────
+
+
+def _structural_narrative(
+    scenario: Scenario, impact: dict, trace: dict | None, alternatives: dict | None
+) -> str:
+    """Rule-generated narrative for a graph-overlay structural scenario."""
+    removed = ", ".join(
+        f"{ed['label']} {ed['name'] or ed['id']}" for ed in impact.get("edits", [])
+    )
+    lines = [f"Structural scenario: {removed} removed from the network."]
+
+    for row in impact.get("echelons", []):
+        if row["connected_drop"] > 0 and not row["removed"]:
+            lines.append(
+                f"{row['echelon']}: {row['connected_drop']} of "
+                f"{row['baseline_connected']} previously connected entities lose "
+                f"their full supply-chain path."
+            )
+    if len(lines) == 1:
+        lines.append(
+            "No surviving entity loses its full supply-chain path — the network "
+            "has redundant routes around the removed entities."
+        )
+
+    hops = [
+        f"{f['echelon']} at hop {f['hop']} ({f['count']} affected)"
+        for f in (trace or {}).get("frontier", [])
+        if f["direction"] == "downstream"
+    ]
+    if hops:
+        lines.append("Downstream exposure: " + "; ".join(hops) + ".")
+
+    for group in (alternatives or {}).get("alternatives", []):
+        partners = group.get("partners") or []
+        if partners and partners[0].get("alternatives"):
+            first = partners[0]
+            alt = first["alternatives"][0]
+            lines.append(
+                f"Nearest alternative {group['removed_label']} for the "
+                f"{len(partners)} affected {group['partner_echelon']} partners: "
+                f"e.g. {first['partner']} → {alt['name']} "
+                f"({alt['distance_miles']} mi)."
+            )
+    return " ".join(lines)
+
+
+def build_structural_comparison(
+    scenario: Scenario,
+    impact: dict,
+    trace: dict | None = None,
+    alternatives: dict | None = None,
+) -> ScenarioComparison:
+    """Comparison for a graph-overlay scenario: per-echelon connectivity KPIs.
+
+    No optimization run is involved — baseline numbers come from the unfiltered
+    graph, scenario numbers from the same queries with the removals applied.
+    """
+    kpi_deltas: list[KpiDelta] = []
+    for row in impact.get("echelons", []):
+        base = float(row["baseline_connected"])
+        scen = float(row["scenario_connected"])
+        kpi_deltas.append(KpiDelta(
+            name=f"connected_{row['echelon']}",
+            baseline=base,
+            scenario=scen,
+            delta=scen - base,
+            pct=((scen - base) / base * 100.0) if base else None,
+            unit="",
+            good_direction="up",
+        ))
+    return ScenarioComparison(
+        baseline_run_id="graph-baseline",
+        scenario_run_id=scenario.scenario_id,
+        scenario_name=scenario.name,
+        scenario_description=scenario.description,
+        kpi_deltas=kpi_deltas,
+        narrative=_structural_narrative(scenario, impact, trace, alternatives),
+    )
+
+
 __all__ = [
     "good_direction",
     "build_kpi_deltas",
@@ -249,4 +330,5 @@ __all__ = [
     "build_tornado_spec",
     "build_narrative",
     "build_comparison",
+    "build_structural_comparison",
 ]

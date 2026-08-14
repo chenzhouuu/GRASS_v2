@@ -47,9 +47,11 @@ _TEAM_DESCRIPTION = """\
 - Cypher: Neo4j graph queries (retrieval, aggregation, spatial lookups).
 - Analytics: Python analysis (pandas/scipy) + Plotly charts.
 - Optimization: LP/MILP optimization via PuLP.
-- ScenarioRunner: what-if re-solve of a prior Optimization baseline under a
-  perturbation (demand/cost ±%, capacity change, entity outage). REQUIRES a
-  preceding Optimization step in the same plan to establish the baseline.
+- ScenarioRunner: what-if analysis. Structural what-ifs (entity outage:
+  stranded entities, cascade, nearest alternatives) run directly on the graph
+  and need NO Optimization step. Numeric what-ifs (demand/cost ±%, capacity
+  change) re-solve a prior Optimization baseline and REQUIRE a preceding
+  Optimization step in the same plan.
 - Report: PDF report generation (only after data + analysis are complete)."""
 
 _LEDGER_SCHEMA = """\

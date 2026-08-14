@@ -102,12 +102,27 @@ class PerturbationInput(BaseModel):
     instruction: str = Field(default="", description="Natural-language change for kind=structural (P3).")
 
 
+class GraphEditInput(BaseModel):
+    """One structural network change (entity outage) — needs NO baseline."""
+    op: Literal["remove_node"] = Field(default="remove_node", description="Edit operation.")
+    label: str = Field(description="Node label on the flow chain, e.g. 'Processor', 'Cooperative'.")
+    name: str = Field(default="", description="Entity display name (ambiguous names are rejected with candidate ids).")
+    id: str = Field(default="", description="Entity id, e.g. 'P0042' (takes precedence over name).")
+
+
 class DefineScenarioInput(BaseModel):
     """Input schema for the define_scenario tool."""
     name: str = Field(description="Short label, e.g. 'Demand +20%' or 'Processor X offline'.")
     description: str = Field(default="", description="One-line natural-language description of the what-if.")
     perturbations: list[PerturbationInput] = Field(
-        default_factory=list, description="Ordered list of typed changes against the baseline."
+        default_factory=list, description="Ordered list of typed numeric changes against the baseline."
+    )
+    graph_edits: list[GraphEditInput] = Field(
+        default_factory=list,
+        description="Structural network changes (entity outages). These run graph "
+        "reachability/cascade analysis and need no optimization baseline. An "
+        "entity outage should carry BOTH a graph_edit and (when a baseline "
+        "exists) a remove_entity perturbation.",
     )
 
 
@@ -246,18 +261,21 @@ class SupervisorAgent:
                 args_schema=DispatchInput,
             ),
             StructuredTool.from_function(
-                func=lambda name="", description="", perturbations=None: "",
+                func=lambda name="", description="", perturbations=None, graph_edits=None: "",
                 name="define_scenario",
                 description=(
-                    "Define a what-if scenario against the EXISTING baseline "
-                    "optimization (requires a prior optimization in this session). "
-                    "Use for questions like 'what if demand rises 20%', 'what if "
-                    "Processor X goes offline', 'what if DC capacity is halved'. "
-                    "Express each change as a typed perturbation: scale_param "
-                    "(factor, e.g. demand x1.2), set_param (value), scale_capacity "
-                    "(factor), or remove_entity (selector). After defining, call "
-                    "dispatch_scenario to run it. Do NOT call dispatch_optimization "
-                    "for a what-if — reuse the baseline."
+                    "Define a what-if scenario. Two kinds of change, combinable: "
+                    "(1) graph_edits — entity outages ('what if Processor X goes "
+                    "offline', 'cooperative Y shuts down'): remove_node runs graph "
+                    "reachability/cascade/nearest-alternative analysis and needs NO "
+                    "prior optimization. (2) perturbations — numeric changes "
+                    "re-solved against the EXISTING baseline optimization ('demand "
+                    "+20%', 'DC capacity halved'): scale_param (factor), set_param "
+                    "(value), scale_capacity (factor), remove_entity (selector); "
+                    "these REQUIRE a prior optimization in this session. An entity "
+                    "outage should carry both kinds when a baseline exists. After "
+                    "defining, call dispatch_scenario to run it. Do NOT call "
+                    "dispatch_optimization for a what-if — reuse the baseline."
                 ),
                 args_schema=DefineScenarioInput,
             ),
@@ -265,10 +283,11 @@ class SupervisorAgent:
                 func=lambda: "Dispatching to Scenario Runner.",
                 name="dispatch_scenario",
                 description=(
-                    "Run the scenario defined by define_scenario: re-solve the "
-                    "baseline on perturbed data and produce a before/after "
-                    "comparison (KPI deltas, binding-constraint shift, waterfall). "
-                    "Call only after define_scenario."
+                    "Run the scenario defined by define_scenario. Numeric "
+                    "perturbations re-solve the baseline and produce KPI deltas, "
+                    "binding-constraint shift, and a waterfall; graph_edits produce "
+                    "per-echelon connectivity impact, a cascade trace, and nearest "
+                    "alternatives. Call only after define_scenario."
                 ),
                 args_schema=EmptyInput,
             ),
@@ -733,14 +752,21 @@ class SupervisorAgent:
             f"{schema_text}\n\n"
             "## Data Query Patterns for Optimization\n"
             "For optimization, use SEPARATE Cypher steps for supply and demand:\n\n"
-            "**Step pattern**: One Cypher step per entity type.\n"
+            "**Step pattern**: One Cypher step per data type.\n"
             "- Step A [Cypher]: Query SUPPLY entities (farms, cooperatives, or processors) "
             "with name, lat, lon, and volume/capacity. Use DISTINCT to avoid duplicates.\n"
             "- Step B [Cypher]: Query DEMAND entities (processors, DCs, or retailers) "
             "with name, lat, lon, and demand/capacity. Use DISTINCT.\n"
-            "- Step C [Optimization]: Solve the LP/MILP using data from Steps A and B.\n\n"
-            "Do NOT combine supply and demand in a single cross-product query — it creates "
-            "N×M rows that overwhelm the optimizer. Keep each query to one entity type.\n\n"
+            "- Step C [Cypher]: Query the CONTRACTED ROUTES at relationship level: MATCH "
+            "existing flow relationships (e.g. (c:Cooperative)-[s:SUPPLIES_RAW_MILK]->"
+            "(p:Processor)) and return both entity ids/names plus the per-route "
+            "properties (s.volume_lbs_month, s.transport_cost_per_cwt or equivalent). "
+            "One row per existing contract. Assignment/flow models CANNOT be formulated "
+            "from entity-level aggregates alone — this step is mandatory for them.\n"
+            "- Step D [Optimization]: Solve the LP/MILP using data from the previous steps.\n\n"
+            "Do NOT build a cartesian cross-product of unrelated entities (N×M rows "
+            "overwhelm the optimizer) — matching EXISTING relationships as in Step C is "
+            "not a cross-product and is required.\n\n"
             "**For large datasets (>200 entities)**: Aggregate farms by cooperative "
             "(12 cooperatives instead of 4940 farms) to keep the LP manageable.\n\n"
             "**Coordinates**: Always use n.lat, n.lon (NOT n.location POINT type).\n\n"
@@ -789,17 +815,13 @@ class SupervisorAgent:
             return f"Geo data extraction failed: {exc}"
 
     def _define_scenario(
-        self, ctx: dict, name: str = "", description: str = "", perturbations=None
+        self, ctx: dict, name: str = "", description: str = "",
+        perturbations=None, graph_edits=None,
     ) -> str:
-        """Define a what-if scenario against the session's baseline optimization."""
-        from ..core.schemas import Perturbation, Scenario
+        """Define a what-if scenario (numeric vs baseline, structural, or both)."""
+        from ..core.schemas import GraphEdit, Perturbation, Scenario
 
         baseline = ctx["state"].get("optimization_baseline")
-        if not baseline:
-            return (
-                "No baseline optimization exists yet in this session. Run an "
-                "optimization first (dispatch_optimization), then define the what-if."
-            )
 
         perts: list[Perturbation] = []
         for p in (perturbations or []):
@@ -807,18 +829,35 @@ class SupervisorAgent:
                 perts.append(Perturbation(**p) if isinstance(p, dict) else Perturbation(**dict(p)))
             except Exception as exc:
                 return f"Invalid perturbation {p!r}: {exc}"
-        if not perts:
+
+        edits: list[GraphEdit] = []
+        for g in (graph_edits or []):
+            try:
+                edits.append(GraphEdit(**g) if isinstance(g, dict) else GraphEdit(**dict(g)))
+            except Exception as exc:
+                return f"Invalid graph edit {g!r}: {exc}"
+
+        if not perts and not edits:
             return (
-                "A what-if scenario needs at least one perturbation "
-                "(e.g. scale_param target='demand' factor=1.2)."
+                "A what-if scenario needs at least one change: a perturbation "
+                "(e.g. scale_param target='demand' factor=1.2) or a graph edit "
+                "(e.g. remove_node label='Processor' name='X')."
+            )
+        if perts and not baseline:
+            return (
+                "Numeric perturbations re-solve an optimization baseline, and none "
+                "exists yet in this session. Either run dispatch_optimization "
+                "first, or define the scenario with graph_edits only (structural "
+                "reachability analysis needs no baseline)."
             )
 
         scenario = Scenario(
             scenario_id=uuid.uuid4().hex[:8],
             name=name or "What-if scenario",
-            baseline_id=baseline.get("run_id", ""),
+            baseline_id=(baseline or {}).get("run_id", ""),
             description=description,
             perturbations=perts,
+            graph_edits=edits,
         )
         ctx["pending_scenario"] = scenario.model_dump()
 
@@ -831,10 +870,13 @@ class SupervisorAgent:
                 return f"remove {p.selector}"
             return f"structural: {p.instruction[:40]}"
 
-        summary = "; ".join(_desc(p) for p in perts)
+        parts = [_desc(p) for p in perts] + [
+            f"remove {g.label} {g.name or g.id}" for g in edits
+        ]
+        summary = "; ".join(parts)
         return (
-            f"Scenario '{scenario.name}' defined ({len(perts)} change(s): {summary}). "
-            f"Now call dispatch_scenario to run it against the baseline."
+            f"Scenario '{scenario.name}' defined ({len(parts)} change(s): {summary}). "
+            f"Now call dispatch_scenario to run it."
         )
 
     def _define_sweep(self, ctx: dict, factors=None) -> str:

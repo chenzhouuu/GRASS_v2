@@ -1,0 +1,28 @@
+# Supply-chain flow chain for Layer-1 structural scenarios.
+#
+# Declares the ordered echelons and the relationship connecting each adjacent
+# pair, upstream -> downstream: hop i is (echelons[i])-[:rels[i]]->(echelons[i+1]).
+# The structural tools (src/tools/graph_scenario.py) build every reachability,
+# cascade, and nearest-alternative query from this file — porting GRASS to a
+# different supply chain graph means writing a new flow_chain.yaml, not code.
+# name_property is display-only; entity identity is the per-echelon
+# id_property (names are NOT unique in this graph: 29 duplicated processor
+# names cover 86 nodes).
+name_property: name
+echelons:
+  - DairyFarm
+  - Cooperative
+  - Processor
+  - DistributionCenter
+  - Retailer
+id_properties:
+  DairyFarm: farm_id
+  Cooperative: coop_id
+  Processor: processor_id
+  DistributionCenter: dc_id
+  Retailer: retailer_id
+rels:
+  - MEMBER_OF
+  - SUPPLIES_RAW_MILK
+  - SHIPS_TO
+  - DELIVERS_TO

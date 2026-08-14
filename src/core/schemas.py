@@ -193,17 +193,44 @@ class Perturbation(BaseModel):
     instruction: str = Field(default="", description="NL instruction for kind=structural.")
 
 
+class GraphEdit(BaseModel):
+    """One structural edit on the graph view of a scenario (Layer 1).
+
+    Graph edits never write to Neo4j: removed entities are excluded from
+    read queries via parameterized predicates at query time, so structural
+    impact tools (reachability, cascade trace, nearest alternatives) work
+    without an optimization baseline.
+    """
+    op: Literal["remove_node"] = Field(
+        default="remove_node", description="Edit operation (P1: node removal only)."
+    )
+    label: str = Field(description="Node label, e.g. 'Processor'.")
+    name: str = Field(
+        default="",
+        description="Entity display name; resolved to an id at execution time. "
+        "Ambiguous names (duplicates exist in this graph) raise with candidates.",
+    )
+    id: str = Field(
+        default="",
+        description="Entity id (e.g. processor_id). Takes precedence over name.",
+    )
+
+
 class Scenario(BaseModel):
     """A named what-if = a diff against a baseline + the comparison spec.
 
     Fully reproducible from its recipe (``baseline_id`` + ordered
     ``perturbations``), mirroring mpi-sppy's ``(name, kwargs)`` contract.
+    ``graph_edits`` carry the Layer-1 structural view (graph reachability);
+    ``perturbations`` carry the Layer-2 numeric view (LP re-solve). An
+    entity-outage scenario typically has both.
     """
     scenario_id: str = Field(description="Unique id for this scenario.")
     name: str = Field(description="Short human label, e.g. 'Processor X offline'.")
     baseline_id: str = Field(default="", description="run_id of the baseline this perturbs.")
     description: str = Field(default="", description="NL description for display/provenance.")
     perturbations: list[Perturbation] = Field(default_factory=list)
+    graph_edits: list[GraphEdit] = Field(default_factory=list)
     requested_kpis: list[str] = Field(
         default_factory=list, description="KPIs to compare in the report (P2)."
     )

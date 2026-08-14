@@ -10,8 +10,12 @@ Structural perturbations (constraint/bound edits) are recorded but deferred to
 P3 (formulation editing). The before/after comparison + presentation is the
 ScenarioInterpreter's job (P2); here we emit a brief inline objective delta.
 
+Structural scenarios (``graph_edits``: entity outages) run through the Layer-1
+graph-overlay tools (src/tools/graph_scenario.py) and need NO optimization
+baseline; numeric perturbations still require one.
+
     runner = ScenarioRunner()
-    update = runner.invoke(state)   # needs "optimization_baseline"; "pending_scenario" optional (plan mode derives it from "worker_task")
+    update = runner.invoke(state)   # "pending_scenario" optional (plan mode derives it from "worker_task")
 """
 
 import logging
@@ -29,9 +33,29 @@ from .optimization_agent import (
     _solution_routes_to_geo,
     build_optimization_run,
 )
-from .scenario_interpreter import build_comparison, build_tornado_spec
+from .scenario_interpreter import (
+    build_comparison,
+    build_structural_comparison,
+    build_tornado_spec,
+)
 
 logger = logging.getLogger(__name__)
+
+# Elastic diagnostic instruction for infeasible scenarios (CS2 Q2.3 contract:
+# report unserved demand and the minimum capacity relaxation, never repair
+# silently). The 1e6 weight makes shortfall a last resort, so the relaxation
+# total is the minimum capacity addition that restores feasibility.
+_ELASTIC_DIAGNOSIS_INSTRUCTION = (
+    "The scenario data makes the model INFEASIBLE. Do not repair it silently — "
+    "build an ELASTIC DIAGNOSTIC version that quantifies the infeasibility: "
+    "(1) add a nonnegative shortfall variable to every demand-satisfaction "
+    "constraint; (2) add a nonnegative relaxation variable to every capacity "
+    "constraint; (3) replace the objective with: minimize "
+    "1000000 * (sum of shortfall variables) + (sum of relaxation variables). "
+    "In SOLUTION_JSON report kpis: total_unserved_demand (sum of shortfalls), "
+    "unserved_entity_count (number of entities with positive shortfall), and "
+    "min_capacity_relaxation (sum of relaxation variables)."
+)
 
 
 class ScenarioRunner:
@@ -52,18 +76,19 @@ class ScenarioRunner:
         baseline_dict = state.get("optimization_baseline")
         scenario_dict = state.get("pending_scenario")
 
-        if not baseline_dict:
-            return self._blocked(
-                "No baseline optimization exists yet. Run an optimization first, "
-                "then I can compare a what-if scenario against it.",
-                state,
-            )
-
         # Sensitivity sweep takes precedence when requested (P3 tornado).
         if state.get("pending_sweep"):
+            if not baseline_dict:
+                return self._blocked(
+                    "A sensitivity sweep re-solves an optimization baseline, and "
+                    "none exists yet. Run an optimization first.",
+                    state,
+                )
             return self.run_sweep(state)
 
-        baseline = OptimizationRun.model_validate(baseline_dict)
+        baseline = (
+            OptimizationRun.model_validate(baseline_dict) if baseline_dict else None
+        )
 
         if not scenario_dict:
             # Plan mode: no pre-built scenario — derive one from the step instruction.
@@ -81,6 +106,42 @@ class ScenarioRunner:
             scenario_dict = derived.model_dump()
 
         scenario = Scenario.model_validate(scenario_dict)
+
+        # Layer 1: structural graph impact — no optimization baseline required.
+        structural_result = None
+        if scenario.graph_edits:
+            try:
+                structural_result = self._run_structural(scenario)
+            except ValueError as exc:  # ill-posed edit: unknown/ambiguous entity
+                return self._blocked(f"The scenario is not well-posed: {exc}", state)
+            except RuntimeError as exc:
+                return self._blocked(f"Structural graph analysis failed: {exc}", state)
+
+        if not scenario.perturbations:
+            if structural_result is None:
+                return self._blocked(
+                    "The scenario contains no changes (no perturbations and no "
+                    "graph edits).",
+                    state,
+                )
+            return self._structural_update(scenario, structural_result, state)
+
+        # Layer 2: numeric re-solve — requires a baseline with cached code.
+        if baseline is None:
+            if structural_result is not None:
+                return self._structural_update(
+                    scenario, structural_result, state,
+                    note="The numeric part of this what-if was skipped: no "
+                         "optimization baseline exists in this session. Run an "
+                         "optimization first for cost/flow deltas.",
+                )
+            return self._blocked(
+                "This what-if changes numeric parameters, which requires a "
+                "baseline optimization. Run an optimization first — or ask a "
+                "structural question (e.g. 'which farms are stranded if X "
+                "closes?'), which needs no baseline.",
+                state,
+            )
 
         if not baseline.code:
             return self._blocked(
@@ -128,13 +189,21 @@ class ScenarioRunner:
                 baseline.code, perturbed, state.get("session_id")
             )
 
+        # 2b. Infeasible scenario → quantify (unserved demand + minimum capacity
+        # relaxation), never repair silently.
+        infeasibility = None
+        if "infeasible" in str((solution or {}).get("status", "")).lower():
+            infeasibility = self._diagnose_infeasibility(
+                scenario, baseline, perturbed, state
+            )
+
         # 3. Build the scenario run snapshot + post-solve visuals (deterministic).
         chart_specs: list[dict] = []
         geo_data: dict | None = None
         scenario_run: OptimizationRun | None = None
         comparison = None
 
-        if solution and not error:
+        if solution and not error and infeasibility is None:
             solution = _enrich_solution_coordinates(solution)
             scenario_run = build_optimization_run(
                 formulation_used, code_used, solution,
@@ -142,6 +211,13 @@ class ScenarioRunner:
             )
             # 4. Before/after comparison (KPI deltas + binding shift + waterfall + narrative).
             comparison = build_comparison(baseline, scenario_run, scenario, model=self.model)
+            if structural_result is not None:
+                s_comp = build_structural_comparison(
+                    scenario, structural_result["impact"], structural_result["trace"],
+                    structural_result["alternatives"],
+                )
+                comparison.kpi_deltas.extend(s_comp.kpi_deltas)
+                comparison.narrative = f"{comparison.narrative} {s_comp.narrative}".strip()
             sankey = _build_sankey_from_solution(solution)
             if sankey:
                 chart_specs.append(sankey)
@@ -149,7 +225,9 @@ class ScenarioRunner:
             if geo.get("features"):
                 geo_data = geo
 
-        summary = self._summary(scenario, baseline, solution, error, plog, comparison)
+        summary = self._summary(
+            scenario, baseline, solution, error, plog, comparison, infeasibility
+        )
 
         update: dict[str, Any] = {
             "messages": [AIMessage(content=summary, name=self.agent_name)],
@@ -158,8 +236,24 @@ class ScenarioRunner:
             "sender": self.agent_name,
             "past_steps": [(f"What-if: {scenario.name}", summary[:400])],
         }
+        if infeasibility is not None:
+            update["worker_feedback"] = [{
+                "type": "scenario_infeasible",
+                "agent": "ScenarioRunner",
+                "message": infeasibility["narrative"],
+            }]
         if scenario_run is not None:
             update["scenario_runs"] = [scenario_run.model_dump()]
+        # A failed or infeasible re-solve still surfaces the structural half.
+        if comparison is None and structural_result is not None:
+            comparison = build_structural_comparison(
+                scenario, structural_result["impact"], structural_result["trace"],
+                structural_result["alternatives"],
+            )
+            if infeasibility is not None:
+                comparison.narrative = (
+                    f"{comparison.narrative} {infeasibility['narrative']}".strip()
+                )
         if comparison is not None:
             update["scenario_comparison"] = comparison.model_dump()
         if chart_specs:
@@ -178,12 +272,16 @@ class ScenarioRunner:
         error: str | None,
         plog: list[str],
         comparison=None,
+        infeasibility: dict | None = None,
     ) -> str:
         lines = [f"**What-if scenario: {scenario.name}**"]
         if scenario.description:
             lines.append(scenario.description)
         lines.append("Perturbations applied: " + ("; ".join(plog) if plog else "none"))
 
+        if infeasibility is not None:
+            lines.append(infeasibility["narrative"])
+            return "\n".join(lines)
         if error:
             lines.append(f"Scenario re-solve failed: {error[:300]}")
             return "\n".join(lines)
@@ -205,6 +303,108 @@ class ScenarioRunner:
             lines.append("")
             lines.append(comparison.narrative)
         return "\n".join(lines)
+
+    def _diagnose_infeasibility(
+        self,
+        scenario: Scenario,
+        baseline: OptimizationRun,
+        perturbed_rows: list[dict],
+        state: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Elastic diagnostic re-solve quantifying an infeasible scenario.
+
+        Reuses the structural-scenario pipeline (formulation edit + codegen)
+        with a fixed elastic instruction. Best-effort: without a model, or if
+        the diagnostic solve itself fails, a plain statement is returned.
+        """
+        plain = {
+            "kpis": {},
+            "narrative": (
+                "The scenario makes the baseline plan infeasible: demand can no "
+                "longer be fully met with the given capacities."
+            ),
+        }
+        if self.model is None:
+            return plain
+
+        from .optimization_agent import OptimizationAgent
+
+        try:
+            res = OptimizationAgent(self.model).resolve_structural_scenario(
+                baseline.formulation.model_dump(),
+                _ELASTIC_DIAGNOSIS_INSTRUCTION,
+                state.get("user_query", ""),
+                perturbed_rows,
+                session_id=state.get("session_id"),
+            )
+        except Exception as exc:  # noqa: BLE001 — diagnosis is best-effort
+            logger.warning("Infeasibility diagnosis failed: %s", exc)
+            return plain
+
+        sol = res.get("solution") or {}
+        kpis = sol.get("kpis") or {}
+        if res.get("error") or not kpis:
+            return plain
+
+        lines = [plain["narrative"], "Elastic diagnosis:"]
+        relax = kpis.get("min_capacity_relaxation")
+        unserved = kpis.get("total_unserved_demand")
+        n_short = kpis.get("unserved_entity_count")
+        if relax is not None:
+            lines.append(
+                f"restoring feasibility requires at least {relax:,.0f} units of "
+                f"additional capacity;"
+            )
+        if unserved:
+            suffix = f" across {int(n_short)} entities" if n_short else ""
+            lines.append(
+                f"{unserved:,.0f} units of demand remain unserved{suffix} even "
+                f"after that relaxation."
+            )
+        elif relax is not None:
+            lines.append("all demand can be served once that capacity is added.")
+        return {"kpis": kpis, "narrative": " ".join(lines)}
+
+    def _run_structural(self, scenario: Scenario) -> dict[str, Any]:
+        """Layer-1 deterministic graph analysis for the scenario's edits."""
+        from ..tools.graph_scenario import (
+            cascade_trace,
+            nearest_alternatives,
+            structural_impact,
+        )
+
+        return {
+            "impact": structural_impact(scenario.graph_edits),
+            "trace": cascade_trace(scenario.graph_edits),
+            "alternatives": nearest_alternatives(scenario.graph_edits),
+        }
+
+    def _structural_update(
+        self,
+        scenario: Scenario,
+        structural: dict[str, Any],
+        state: dict[str, Any],
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        """State update for a structural-only what-if (no LP re-solve)."""
+        comparison = build_structural_comparison(
+            scenario, structural["impact"], structural["trace"],
+            structural["alternatives"],
+        )
+        summary = f"**What-if scenario: {scenario.name}**\n{comparison.narrative}"
+        if note:
+            summary += f"\n\n{note}"
+        update: dict[str, Any] = {
+            "messages": [AIMessage(content=summary, name=self.agent_name)],
+            "sender": self.agent_name,
+            "scenario_comparison": comparison.model_dump(),
+            "past_steps": [(f"What-if: {scenario.name}", summary[:400])],
+        }
+        if note:
+            update["worker_feedback"] = [{
+                "type": "scenario_partial", "agent": "ScenarioRunner", "message": note,
+            }]
+        return update
 
     def _blocked(self, message: str, state: dict[str, Any]) -> dict[str, Any]:
         return {
