@@ -2,15 +2,19 @@
 
 Writes code to a file and executes it via subprocess, capturing
 stdout and stderr.  Data from previous agents (e.g. cypher_results)
-is persisted to ``data/cypher_results.json`` so that executed code
-can load it with ``pd.read_json`` or ``json.load``.
+is persisted to a per-session JSON file (``data/outputs/<session>/
+cypher_results.json``) so that executed code can load it with
+``pd.read_json`` or ``json.load``; agents inject the concrete path
+into their prompts. Without a session id the legacy shared path
+``data/cypher_results.json`` is used (benchmarks, tests).
 """
 
 import json
 import os
+import re
 import subprocess
 import tempfile
-from typing import Annotated
+from typing import Annotated, Optional
 
 from langchain_core.tools import tool
 
@@ -20,19 +24,40 @@ DATA_DIR = os.path.join(
 )
 os.makedirs(DATA_DIR, exist_ok=True)
 
+PROJECT_ROOT = os.path.dirname(DATA_DIR)
+
 TIMEOUT_SECONDS = 120
 MAX_OUTPUT_CHARS = 30_000
 
 
-def persist_cypher_results(records: list[dict]) -> str:
-    """Write cypher_results to a JSON file so executed code can load it.
+def cypher_results_path(session_id: Optional[str] = None) -> str:
+    """Relative path (from project root) of the session's data file.
 
-    Returns the absolute path to the written file.
+    Per-session isolation: two concurrent sessions must never read each
+    other's rows. Generated code runs with the project root as its working
+    directory, so this relative path is what agents substitute into prompts.
+    The session id is sanitized because it arrives from the client API.
     """
-    path = os.path.join(DATA_DIR, "cypher_results.json")
-    with open(path, "w", encoding="utf-8") as f:
+    if session_id:
+        safe = re.sub(r"[^A-Za-z0-9_-]", "_", session_id)
+        return f"data/outputs/{safe}/cypher_results.json"
+    return "data/cypher_results.json"
+
+
+def persist_cypher_results(
+    records: list[dict], session_id: Optional[str] = None
+) -> str:
+    """Write cypher_results to the session's JSON file.
+
+    Returns the project-root-relative path to the written file (the same
+    string agents inject into prompts).
+    """
+    rel_path = cypher_results_path(session_id)
+    abs_path = os.path.join(PROJECT_ROOT, rel_path)
+    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+    with open(abs_path, "w", encoding="utf-8") as f:
         json.dump(records, f, indent=2, default=str)
-    return path
+    return rel_path
 
 
 @tool
@@ -44,9 +69,9 @@ def execute_python(
     The code is written to a temporary file and run as a subprocess.
     stdout and stderr are captured and returned.
 
-    Data from previous agents is available at ``data/cypher_results.json``.
-    Use ``import json; data = json.load(open('data/cypher_results.json'))``
-    or ``pandas.read_json('data/cypher_results.json')`` to load it.
+    Data from previous agents is available at the per-session path given
+    in the prompt (``data/outputs/<session>/cypher_results.json``); load it
+    with ``json.load`` or ``pandas.read_json``.
     """
     # Write script to a unique temp file to avoid race conditions
     fd, code_path = tempfile.mkstemp(suffix=".py", prefix="grass_agent_")

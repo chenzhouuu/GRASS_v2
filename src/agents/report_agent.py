@@ -151,9 +151,13 @@ class ReportAgent:
         Returns a state-update dict with keys:
             messages, report_file, sender.
         """
-        # ── persist upstream data ────────────────────────────────
+        # ── persist upstream data (per-session file) ─────────────
         cypher_results = state.get("cypher_results") or []
-        persist_cypher_results(cypher_results)
+        data_path = persist_cypher_results(cypher_results, state.get("session_id"))
+        # The PDF goes into the same per-session directory so concurrent
+        # sessions cannot overwrite each other's reports; /api/files serves
+        # data/outputs/<session>/ by basename.
+        report_path = os.path.join(os.path.dirname(data_path), "report.pdf")
 
         # ── build system prompt ──────────────────────────────────
         template = _load_prompt_template()
@@ -165,6 +169,8 @@ class ReportAgent:
             .replace("{analysis_summary}", _summarize_analysis(state))
             .replace("{viz_summary}", _summarize_viz(state))
             .replace("{optimization_summary}", _summarize_optimization(state))
+            .replace("{data_path}", data_path)
+            .replace("{report_path}", report_path)
         )
 
         # ── assemble conversation ────────────────────────────────
@@ -181,11 +187,11 @@ class ReportAgent:
             HumanMessage(content=(
                 f"Generate the PDF report for: {state.get('user_query', '')}\n\n"
                 f"Data rows available: {len(cypher_results)}\n"
-                f"Data file: data/cypher_results.json"
+                f"Data file: {data_path}"
                 f"{viz_note}\n\n"
                 "Write the complete Python script and execute it with "
                 "the execute_python tool.  The script must save the PDF "
-                "and print REPORT_PATH: data/report.pdf"
+                f"and print REPORT_PATH: {report_path}"
             )),
         ]
 

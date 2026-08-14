@@ -37,6 +37,7 @@ from ..core.planning import (
     extract_json_from_string,
     validate_plan_json,
 )
+from ..utils.message_history import trim_history
 from ..utils.schema_loader import get_schema as load_schema_text
 
 logger = logging.getLogger(__name__)
@@ -328,9 +329,7 @@ class PlannerAgent:
             )
         )
 
-        history = list(state.get("messages", []))
-        if len(history) > MAX_HISTORY_MESSAGES:
-            history = [history[0]] + history[-MAX_HISTORY_MESSAGES:]
+        history = trim_history(list(state.get("messages", [])), MAX_HISTORY_MESSAGES)
 
         if replan:
             instruction = (

@@ -660,7 +660,7 @@ class OptimizationAgent:
     def _run_pipeline(self, state: dict[str, Any]) -> dict[str, Any]:
         # Prefer accumulated results (from all Cypher steps) over latest-only
         cypher_results = state.get("all_query_results") or state.get("cypher_results") or []
-        persist_cypher_results(cypher_results)
+        data_path = persist_cypher_results(cypher_results, state.get("session_id"))
         task = state.get("worker_task") or "Formulate and solve an optimization problem."
         user_query = state.get("user_query", "")
 
@@ -679,7 +679,7 @@ class OptimizationAgent:
             formulation = self._run_stage1(task, user_query, data_context, data_summary)
 
         # ── Stage 3: Generate Code ───────────────────────────────
-        code_result = self._run_stage3(formulation, data_preview, user_query)
+        code_result = self._run_stage3(formulation, data_preview, user_query, data_path)
 
         # ── Stage 4: Post-process ────────────────────────────────
         return self._build_result(formulation, code_result, state)
@@ -836,6 +836,7 @@ class OptimizationAgent:
         instruction: str,
         user_query: str,
         perturbed_rows: list[dict],
+        session_id: str | None = None,
     ) -> dict[str, Any]:
         """Re-solve a what-if that structurally edits the baseline formulation (P3).
 
@@ -844,11 +845,11 @@ class OptimizationAgent:
         deterministically-perturbed) data. Returns the modified formulation, the
         regenerated code, and the parsed solution.
         """
-        persist_cypher_results(perturbed_rows)
+        data_path = persist_cypher_results(perturbed_rows, session_id)
         base = OptimizationFormulation.model_validate(base_formulation)
         formulation = self._modify_formulation(base, instruction)
         data_preview = make_data_preview(perturbed_rows, max_rows=3)
-        code_result = self._run_stage3(formulation, data_preview, user_query)
+        code_result = self._run_stage3(formulation, data_preview, user_query, data_path)
         output = code_result.get("last_output") or ""
         error = code_result.get("last_error")
         solution = _extract_solution_json(output) if not error else None
@@ -860,7 +861,11 @@ class OptimizationAgent:
         }
 
     def _run_stage3(
-        self, formulation: OptimizationFormulation, data_preview: str, user_query: str,
+        self,
+        formulation: OptimizationFormulation,
+        data_preview: str,
+        user_query: str,
+        data_path: str = "data/cypher_results.json",
     ) -> dict[str, Any]:
         """Stage 3+4: Generate code, execute, and collect results."""
         template = load_prompt("optimization_codegen.txt")
@@ -868,6 +873,7 @@ class OptimizationAgent:
             template
             .replace("{formulation_json}", formulation.model_dump_json(indent=2))
             .replace("{data_preview}", data_preview)
+            .replace("{data_path}", data_path)
         )
 
         messages: list = [
@@ -1137,7 +1143,7 @@ class OptimizationAgent:
     def _run_single_shot(self, state: dict[str, Any]) -> dict[str, Any]:
         """Fallback: direct code generation without structured formulation."""
         cypher_results = state.get("all_query_results") or state.get("cypher_results") or []
-        persist_cypher_results(cypher_results)
+        data_path = persist_cypher_results(cypher_results, state.get("session_id"))
         task = state.get("worker_task") or "Formulate and solve an optimization problem."
         user_query = state.get("user_query", "")
 
@@ -1147,13 +1153,14 @@ class OptimizationAgent:
             template
             .replace("{formulation_json}", f"(No structured formulation — generate from task: {task})")
             .replace("{data_preview}", data_preview)
+            .replace("{data_path}", data_path)
         )
 
         messages: list = [
             SystemMessage(content=system_prompt),
             HumanMessage(content=(
                 f"User question: {user_query}\n\nTask: {task}\n\n"
-                f"Data at data/cypher_results.json ({len(cypher_results)} rows). "
+                f"Data at {data_path} ({len(cypher_results)} rows). "
                 f"Write PuLP code, execute via execute_python, print SOLUTION_JSON."
             )),
         ]

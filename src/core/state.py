@@ -30,6 +30,10 @@ class GRASSState(TypedDict):
     # -- user query -----------------------------------------------------
     user_query: str
     region_bbox: Optional[str]
+    # Session identity, set per-request by the API. Workers use it to derive
+    # the per-session data-file path (data/outputs/<session>/...), isolating
+    # concurrent sessions from each other.
+    session_id: Optional[str]
 
     # -- Supervisor control (replaces intent, plan, current_step_index,
     #    completed_steps, response) --------------------------------------
@@ -120,3 +124,72 @@ class GRASSState(TypedDict):
 
     # -- Metadata -------------------------------------------------------
     sender: Optional[str]
+
+
+# Per-turn transient fields and their reset values, merged into the initial
+# state of every user turn (src/api/chat.py). The checkpointer preserves the
+# previous turn's value for any key omitted from the initial state, so every
+# per-turn transient field MUST appear here — a field added to GRASSState but
+# not listed here (or exempted below) leaks across turns. That was the
+# ledger-routing bug fixed 2026-08-14: a stale ``execution_engine`` routed
+# direct-mode workers into the plan executor, and a stale ``pending_scenario``
+# re-ran the previous what-if. ``tests/test_state.py`` enforces that every
+# GRASSState field is classified either here or in TURN_DURABLE_FIELDS.
+TURN_RESET_STATE: dict = {
+    # Supervisor control
+    "next_worker": None,
+    "worker_task": None,
+    "supervisor_plan": None,
+    "requires_geo": False,
+    "requires_optimization": False,
+    # Co-planning
+    "in_planning_mode": None,
+    "plan": None,
+    "plan_str": None,
+    "n_replans": 0,
+    "plan_route": None,
+    "replan_feedback": None,
+    # Progress-ledger executor
+    "execution_engine": None,
+    "current_step_idx": 0,
+    "n_rounds": 0,
+    "information_collected": None,
+    "last_progress_signature": None,
+    "stall_rounds": 0,
+    # Cypher outputs
+    "cypher_query": None,
+    "cypher_results": None,
+    "cypher_error": None,
+    "cypher_metadata": None,
+    # Analytics outputs
+    "analysis_code": None,
+    "analysis_results": None,
+    "analysis_error": None,
+    "chart_specs": None,
+    "geo_data": None,
+    # Optimization outputs
+    "optimization_model": None,
+    "optimization_solution": None,
+    "optimization_error": None,
+    # Scenario engine (the baseline itself is durable, see below)
+    "pending_scenario": None,
+    "pending_sweep": None,
+    "scenario_comparison": None,
+    # Report + response
+    "report_file": None,
+    "response_markdown": None,
+    "sender": None,
+}
+
+# GRASSState fields deliberately NOT reset each turn:
+#   - messages / user_query / region_bbox / mode: set per-request by the API.
+#   - optimization_baseline: session-durable by design — one baseline per
+#     session, later what-ifs perturb it.
+#   - past_steps / worker_feedback / all_query_results / scenario_runs:
+#     append-only reducers; an initial [] appends nothing, so they persist
+#     for the session's lifetime.
+TURN_DURABLE_FIELDS = frozenset({
+    "messages", "user_query", "region_bbox", "mode", "session_id",
+    "optimization_baseline",
+    "past_steps", "worker_feedback", "all_query_results", "scenario_runs",
+})

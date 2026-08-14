@@ -47,8 +47,8 @@ Generate Python code that creates a PDF with the following sections:
 - Use `pdf.set_font("Helvetica", ...)` — do NOT use Times or any TTF font.
 - Section headers: Helvetica Bold 14pt.  Body: Helvetica 10pt.
 - Embed PNG charts with `pdf.image(path, w=170)` — check the file exists first.
-- Save the PDF to `data/report.pdf` and **print the path** so it can be extracted.
-- Print exactly: `REPORT_PATH: data/report.pdf`
+- Save the PDF to `{report_path}` and **print the path** so it can be extracted.
+- Print exactly: `REPORT_PATH: {report_path}`
 - Handle long text with `pdf.multi_cell(0, 6, text)`.
 - Add page numbers in the footer.
 
@@ -72,10 +72,10 @@ Generate Python code that creates a PDF with the following sections:
 ## Execution
 
 Write a single Python script that:
-1. Loads data from `data/cypher_results.json` if it exists.
+1. Loads data from `{data_path}` if it exists.
 2. Builds the PDF with all sections above.
 3. Embeds any existing chart images from the data/ directory.
-4. Saves to `data/report.pdf`.
-5. Prints `REPORT_PATH: data/report.pdf`.
+4. Saves to `{report_path}`.
+5. Prints `REPORT_PATH: {report_path}`.
 
 Execute it using the `execute_python` tool.

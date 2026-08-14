@@ -28,6 +28,15 @@ from ..utils.tracing import configure_tracing
 logger = logging.getLogger(__name__)
 
 
+# Upper bound on LangGraph super-steps per run, passed as ``recursion_limit``
+# in the run config by every production caller (src/api/chat.py). LangGraph's
+# default is 25, which a plan-mode run exceeds routinely: the Executor alone
+# allows max_turns=20 ledger turns, each dispatch costing 2 super-steps
+# (Executor + worker), plus Planner/PlanGate (2), up to max_replans=3 replan
+# cycles (Replan + PlanGate each, +6), and Finalize (1) ≈ 49 worst-case.
+GRAPH_RECURSION_LIMIT = 60
+
+
 # -- stub node factory -----------------------------------------------
 
 def _make_stub(name: str) -> Callable[[GRASSState], dict[str, Any]]:

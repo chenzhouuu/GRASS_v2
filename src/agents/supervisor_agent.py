@@ -17,6 +17,7 @@ from typing import Any, Literal
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from pydantic import BaseModel, Field
 
+from ..utils.message_history import trim_history
 from ..utils.prompt_assembler import PromptAssembler
 from ..utils.schema_loader import get_schema as load_schema_text
 from ..core.schemas import PlanOutput
@@ -502,9 +503,9 @@ class SupervisorAgent:
             sanitized_history.append(msg)
         history = sanitized_history
 
-        # Trim to prevent context overflow
-        if len(history) > MAX_HISTORY_MESSAGES:
-            history = [history[0]] + history[-MAX_HISTORY_MESSAGES:]
+        # Trim to prevent context overflow (pair-preserving: never lets the
+        # window start on an orphaned ToolMessage).
+        history = trim_history(history, MAX_HISTORY_MESSAGES)
 
         # Inject worker results summary if returning from a worker
         context_parts = []

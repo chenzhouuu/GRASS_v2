@@ -75,7 +75,9 @@ def _strip_plotly_markers(output: Any) -> str:
     return _strip_plotly_markers_text(_coerce_message_content(output))
 
 
-def _classify_error(error: str, data_summary: dict) -> str:
+def _classify_error(
+    error: str, data_summary: dict, data_path: str = "data/cypher_results.json"
+) -> str:
     """Classify execution error and provide targeted fix hints.
 
     Inspired by PandasAI's error-type-specific correction prompts.
@@ -115,10 +117,10 @@ def _classify_error(error: str, data_summary: dict) -> str:
         return "Value error. Check for empty DataFrames, NaN values, or invalid parameters."
 
     if "filenotfounderror" in error_lower:
-        return "File not found. Data is at data/cypher_results.json — use this exact path."
+        return f"File not found. Data is at {data_path} — use this exact path."
 
     if "jsondecodeerror" in error_lower:
-        return "JSON parsing failed. Use pd.read_json('data/cypher_results.json') to load data."
+        return f"JSON parsing failed. Use pd.read_json('{data_path}') to load data."
 
     if "timeout" in error_lower:
         return "Execution timed out. Simplify the code — avoid large loops or complex operations."
@@ -225,9 +227,9 @@ class AnalyticsAgent:
             messages, analysis_code, analysis_results, analysis_error,
             chart_specs, past_steps, sender.
         """
-        # ── persist upstream data ────────────────────────────────
+        # ── persist upstream data (per-session file) ─────────────
         cypher_results = state.get("cypher_results") or []
-        persist_cypher_results(cypher_results)
+        data_path = persist_cypher_results(cypher_results, state.get("session_id"))
 
         # ── build task description ───────────────────────────────
         task = state.get("worker_task") or (
@@ -247,6 +249,7 @@ class AnalyticsAgent:
             .replace("{data_summary}", data_context)
             .replace("{data_preview}", raw_preview)
             .replace("{task}", task)
+            .replace("{data_path}", data_path)
         )
 
         # ── assemble conversation ────────────────────────────────
@@ -257,7 +260,7 @@ class AnalyticsAgent:
                 f"User question: {user_query}\n\n"
                 f"Your task: {task}\n\n"
                 f"The data ({len(cypher_results)} rows) has been saved to "
-                f"data/cypher_results.json. Write Python code to analyze "
+                f"{data_path}. Write Python code to analyze "
                 f"the data and create Plotly visualizations, then execute "
                 f"it using the execute_python tool.\n\n"
                 f"Remember: output each Plotly figure using:\n"
@@ -334,7 +337,7 @@ class AnalyticsAgent:
                     "Analytics attempt %d/%d failed: %s",
                     failed_attempts, MAX_RETRIES + 1, last_error[:200],
                 )
-                hint = _classify_error(last_error, data_summary)
+                hint = _classify_error(last_error, data_summary, data_path)
                 messages.append(HumanMessage(content=(
                     f"Code execution failed:\n{last_error}\n\n"
                     f"Hint: {hint}\n\n"

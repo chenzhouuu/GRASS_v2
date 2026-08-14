@@ -18,7 +18,8 @@ from langgraph.types import Command
 from pydantic import BaseModel
 from sse_starlette import EventSourceResponse
 
-from ..core.state import GRASSState
+from ..core.graph import GRAPH_RECURSION_LIMIT
+from ..core.state import GRASSState, TURN_RESET_STATE
 from ..utils.nvl_transformer import records_to_nvl_graph
 from ..utils.neo4j_serializer import to_jsonable as _to_jsonable
 from .sessions import append_message, ensure_session_exists, get_effective_session_model_config
@@ -507,7 +508,10 @@ async def submit_plan_decision(body: PlanDecisionRequest):
             graph = await _resolve_graph(session_id)
             if graph is None:
                 raise RuntimeError("LangGraph not initialized")
-            config = {"configurable": {"thread_id": session_id}}
+            config = {
+                "configurable": {"thread_id": session_id},
+                "recursion_limit": GRAPH_RECURSION_LIMIT,
+            }
             async for event in _emit_graph_events(
                 graph, Command(resume=resume_value), body.run_id, session_id, config
             ):
@@ -564,49 +568,23 @@ async def stream_chat(run_id: str):
             except Exception:
                 pass  # Non-critical — don't block chat if config lookup fails
 
-            # Initial state — Supervisor architecture
+            # Initial state — per-turn transients are reset centrally via
+            # TURN_RESET_STATE (src/core/state.py) so checkpointed values from
+            # the previous turn cannot leak into this one.
             initial_state: GRASSState = {
+                **TURN_RESET_STATE,
                 "messages": [HumanMessage(content=user_message_with_region)],
                 "user_query": user_message_with_region,
                 "region_bbox": region_bbox,
+                "session_id": session_id,
                 # Co-planning mode (default "direct")
                 "mode": run_data.get("mode", "direct"),
-                "in_planning_mode": None,
-                "plan": None,
-                "plan_str": None,
-                "n_replans": 0,
-                "plan_route": None,
-                "replan_feedback": None,
-                # Supervisor control
-                "next_worker": None,
-                "worker_task": None,
-                "supervisor_plan": None,
-                "requires_geo": False,
-                "requires_optimization": False,
-                # Evaluation
-                "past_steps": [],
-                # Worker feedback
-                "worker_feedback": [],
-                # Worker outputs
-                "cypher_query": None,
-                "cypher_results": None,
-                "cypher_error": None,
-                "cypher_metadata": None,
-                "all_query_results": [],
-                "analysis_code": None,
-                "analysis_results": None,
-                "analysis_error": None,
-                "chart_specs": None,
-                "geo_data": None,
-                "optimization_model": None,
-                "optimization_solution": None,
-                "optimization_error": None,
-                "report_file": None,
-                "response_markdown": None,
-                "sender": None,
             }
 
-            config = {"configurable": {"thread_id": session_id}}
+            config = {
+                "configurable": {"thread_id": session_id},
+                "recursion_limit": GRAPH_RECURSION_LIMIT,
+            }
             async for event in _emit_graph_events(
                 graph, initial_state, run_id, session_id, config
             ):

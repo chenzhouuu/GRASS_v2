@@ -117,13 +117,16 @@ class ScenarioRunner:
                 instruction,
                 state.get("user_query", ""),
                 perturbed,
+                session_id=state.get("session_id"),
             )
             formulation_used = res["formulation"]
             code_used = res["code"] or baseline.code
             solution = res["solution"]
             error = res["error"]
         else:
-            solution, error = self._solve(baseline.code, perturbed)
+            solution, error = self._solve(
+                baseline.code, perturbed, state.get("session_id")
+            )
 
         # 3. Build the scenario run snapshot + post-solve visuals (deterministic).
         chart_specs: list[dict] = []
@@ -213,9 +216,15 @@ class ScenarioRunner:
             "past_steps": [("What-if scenario", message[:200])],
         }
 
-    def _solve(self, code: str, rows: list[dict]) -> tuple[dict | None, str | None]:
-        """Run cached solver code against ``rows``; return (solution, error)."""
-        persist_cypher_results(rows)
+    def _solve(
+        self, code: str, rows: list[dict], session_id: str | None = None
+    ) -> tuple[dict | None, str | None]:
+        """Run cached solver code against ``rows``; return (solution, error).
+
+        The rows must go to the session's data file — the cached code has
+        that path baked in from codegen time.
+        """
+        persist_cypher_results(rows, session_id)
         exec_result = execute_python.invoke({"code": code})
         output = exec_result.get("output") or ""
         error = exec_result.get("error")
@@ -250,14 +259,14 @@ class ScenarioRunner:
                     baseline.input_data,
                     [Perturbation(kind="scale_param", target=target, factor=float(f["low"]), selector=selector)],
                 )
-                sol, err = self._solve(baseline.code, rows)
+                sol, err = self._solve(baseline.code, rows, state.get("session_id"))
                 low_obj = sol.get("objective") if (sol and not err) else None
             if f.get("high") is not None:
                 rows, _ = apply_perturbations(
                     baseline.input_data,
                     [Perturbation(kind="scale_param", target=target, factor=float(f["high"]), selector=selector)],
                 )
-                sol, err = self._solve(baseline.code, rows)
+                sol, err = self._solve(baseline.code, rows, state.get("session_id"))
                 high_obj = sol.get("objective") if (sol and not err) else None
             results.append({"factor": f.get("name", target), "low_obj": low_obj, "high_obj": high_obj})
 

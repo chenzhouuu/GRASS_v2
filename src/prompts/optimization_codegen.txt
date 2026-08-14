@@ -20,7 +20,7 @@ import shutil
 import plotly.graph_objects as go
 import plotly.io as pio
 
-df = pd.read_json("data/cypher_results.json")
+df = pd.read_json("{data_path}")
 
 # Build supply points from farm columns (deduplicate joined rows)
 farms = df[["farm_name", "farm_lat", "farm_lon", "farm_prod"]].drop_duplicates("farm_name").reset_index(drop=True)
@@ -169,7 +169,7 @@ import numpy as np
 import plotly.graph_objects as go
 import plotly.io as pio
 
-df = pd.read_json("data/cypher_results.json")
+df = pd.read_json("{data_path}")
 
 # Deduplicate supply points (cooperatives/farms may appear in multiple rows)
 supply = df[["name", "lat", "lon", "volume"]].drop_duplicates("name").reset_index(drop=True)
@@ -261,7 +261,7 @@ concatenated together. Each row has a `_query_step` field indicating which query
 
 Split the data using `_query_step`:
 ```python
-df = pd.read_json("data/cypher_results.json")
+df = pd.read_json("{data_path}")
 
 # Split by _query_step (each Cypher query has a different step label)
 steps = df["_query_step"].unique()
