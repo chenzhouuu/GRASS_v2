@@ -17,6 +17,7 @@ from langchain_core.tools import BaseTool
 
 from ..tools.entity_resolver import resolve_entity
 from ..tools.neo4j_tools import execute_read_cypher, get_schema, validate_cypher
+from ..tools.session_workspace import get_workspace
 from ..utils.schema_loader import get_schema as load_schema_text
 
 logger = logging.getLogger(__name__)
@@ -105,12 +106,25 @@ class CypherAgent:
             ],
         }
 
+        # Register the result set as a named workspace table so later
+        # Analytics steps can reach data from EVERY retrieval step, not
+        # just the last one (P2-a).
+        workspace = get_workspace(state.get("session_id"))
+        if workspace and records:
+            table = workspace.register_table(records, description=task_desc[:80])
+            result["cypher_metadata"]["workspace_table"] = table["name"]
+
         result_summary = self._summarize_step_result(
             loop_result["query"],
             records,
             loop_result["error"],
             final_content,
         )
+        if result["cypher_metadata"].get("workspace_table"):
+            result_summary += (
+                f" [saved as workspace table "
+                f"'{result['cypher_metadata']['workspace_table']}']"
+            )
         result["past_steps"] = [(task_desc, result_summary)]
 
         feedback = self._assess_data_quality(records, state)

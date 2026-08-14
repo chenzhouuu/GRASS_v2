@@ -30,6 +30,11 @@ TIMEOUT_SECONDS = 120
 MAX_OUTPUT_CHARS = 30_000
 
 
+def sanitize_session_id(session_id: str) -> str:
+    """Make a client-supplied session id safe to use as a directory name."""
+    return re.sub(r"[^A-Za-z0-9_-]", "_", session_id)
+
+
 def cypher_results_path(session_id: Optional[str] = None) -> str:
     """Relative path (from project root) of the session's data file.
 
@@ -39,8 +44,7 @@ def cypher_results_path(session_id: Optional[str] = None) -> str:
     The session id is sanitized because it arrives from the client API.
     """
     if session_id:
-        safe = re.sub(r"[^A-Za-z0-9_-]", "_", session_id)
-        return f"data/outputs/{safe}/cypher_results.json"
+        return f"data/outputs/{sanitize_session_id(session_id)}/cypher_results.json"
     return "data/cypher_results.json"
 
 

@@ -24,6 +24,7 @@ from typing import Any
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from ..tools.python_executor import execute_python, persist_cypher_results
+from ..tools.session_workspace import format_catalog_for_prompt, get_workspace
 from ..utils.data_summarizer import summarize_data, format_summary_for_prompt, make_data_preview
 from ..utils.prompt_loader import load_prompt
 from ..utils.plotly_markers import (
@@ -227,9 +228,54 @@ class AnalyticsAgent:
             messages, analysis_code, analysis_results, analysis_error,
             chart_specs, past_steps, sender.
         """
-        # ── persist upstream data (per-session file) ─────────────
+        # ── locate upstream data ─────────────────────────────────
+        # Workspace mode: the session's retrieval steps are registered as
+        # named tables (P2-a); the prompt carries the full catalog so this
+        # agent can consume data from ANY step of a multi-step plan.
+        # Legacy mode (no session id, or no tables yet): persist the latest
+        # rows to the single per-session file, as before.
         cypher_results = state.get("cypher_results") or []
-        data_path = persist_cypher_results(cypher_results, state.get("session_id"))
+        workspace = get_workspace(state.get("session_id"))
+        catalog = workspace.catalog() if workspace else []
+        data_summary = summarize_data(cypher_results)
+
+        if catalog:
+            data_path = " , ".join(e["path"] for e in catalog)
+            data_access = (
+                "This session's query results are available as named tables "
+                "(one JSON file per retrieval step). Load any table with:\n"
+                "```python\n"
+                "import pandas as pd\n"
+                'df = pd.read_json("<table path>")\n'
+                "```\n\n"
+                "### Table catalog\n"
+                f"{format_catalog_for_prompt(catalog)}\n\n"
+                f"The most recent retrieval is table '{catalog[-1]['name']}'."
+            )
+            data_note = (
+                f"The session workspace holds {len(catalog)} table(s); see the "
+                f"Table catalog in the system prompt. The most recent is "
+                f"'{catalog[-1]['name']}' ({catalog[-1]['rows']} rows) at "
+                f"{catalog[-1]['path']}."
+            )
+        else:
+            data_path = persist_cypher_results(cypher_results, state.get("session_id"))
+            data_context = format_summary_for_prompt(data_summary)
+            raw_preview = make_data_preview(cypher_results, max_rows=3)
+            data_access = (
+                f"The data has been saved to: {data_path}\n\n"
+                "Load it with:\n"
+                "```python\n"
+                "import pandas as pd\n"
+                f'df = pd.read_json("{data_path}")\n'
+                "```\n\n"
+                f"### Data Summary (column statistics)\n{data_context}\n\n"
+                f"### Sample Rows\n{raw_preview}"
+            )
+            data_note = (
+                f"The data ({len(cypher_results)} rows) has been saved to "
+                f"{data_path}."
+            )
 
         # ── build task description ───────────────────────────────
         task = state.get("worker_task") or (
@@ -237,19 +283,12 @@ class AnalyticsAgent:
             "appropriate Plotly visualizations."
         )
 
-        # ── build data context (LIDA-inspired summarizer) ────────
-        data_summary = summarize_data(cypher_results)
-        data_context = format_summary_for_prompt(data_summary)
-        raw_preview = make_data_preview(cypher_results, max_rows=3)
-
         # ── build system prompt ──────────────────────────────────
         template = load_prompt("analytics_agent.txt")
         system_prompt = (
             template
-            .replace("{data_summary}", data_context)
-            .replace("{data_preview}", raw_preview)
+            .replace("{data_access}", data_access)
             .replace("{task}", task)
-            .replace("{data_path}", data_path)
         )
 
         # ── assemble conversation ────────────────────────────────
@@ -259,8 +298,7 @@ class AnalyticsAgent:
             HumanMessage(content=(
                 f"User question: {user_query}\n\n"
                 f"Your task: {task}\n\n"
-                f"The data ({len(cypher_results)} rows) has been saved to "
-                f"{data_path}. Write Python code to analyze "
+                f"{data_note} Write Python code to analyze "
                 f"the data and create Plotly visualizations, then execute "
                 f"it using the execute_python tool.\n\n"
                 f"Remember: output each Plotly figure using:\n"

@@ -4,19 +4,7 @@ retrieved by earlier agents (typically from a Neo4j graph database).
 
 ## Available Data
 
-The data has been saved to: {data_path}
-
-Load it with:
-```python
-import pandas as pd
-df = pd.read_json("{data_path}")
-```
-
-### Data Summary (column statistics)
-{data_summary}
-
-### Sample Rows
-{data_preview}
+{data_access}
 
 ## Task
 {task}
