@@ -15,3 +15,34 @@ frontend/node_modules/
 .DS_Store
 .mcp.json
 frontend/.claude/
+
+# ── Policy (2026-08-18): only frontend + backend code is versioned ──────────
+# Data, tests, papers, docs, logs, research artifacts stay local.
+data/
+tests/
+docs/
+paper/
+refine-logs/
+temp/
+case/
+figures/
+presentation/
+.superpowers/
+src/benchmarks/
+/pytest.ini
+/package.json
+/package-lock.json
+/scripts/
+/tools/
+*.log
+/*.png
+/*.pdf
+/*.zip
+/console-messages.json
+/test-settings-*.js
+/IDEA_REPORT.md
+/PAPER_PLAN.md
+/GRASS_CaseStudy_Specification.md
+/task_plan.md
+.codex
+.claude/
