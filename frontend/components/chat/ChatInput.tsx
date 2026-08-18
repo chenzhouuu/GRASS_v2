@@ -1,9 +1,10 @@
 "use client";
 
 import { useRef, useCallback, useEffect, useState } from "react";
-import { ArrowUp, MapPin, X } from "lucide-react";
+import { ArrowUp, MapPin, Square, X } from "lucide-react";
 import { useChatStore } from "@/stores/chatStore";
 import { useMapStore } from "@/stores/mapStore";
+import { stopActiveRun } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { PlanModeToggle } from "./PlanModeToggle";
 
@@ -106,20 +107,36 @@ export function ChatInput({ onSend }: ChatInputProps) {
             {isMac ? "⌘" : "Ctrl"}↩
           </kbd>
 
-          {/* Send button */}
-          <button
-            onClick={handleSend}
-            disabled={!inputDraft.trim() || isStreaming}
-            className={cn(
-              "flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition-colors",
-              "bg-primary text-primary-foreground",
-              "hover:bg-accent-hover",
-              "disabled:bg-muted disabled:text-muted-foreground disabled:cursor-not-allowed"
-            )}
-            aria-label="Send message"
-          >
-            <ArrowUp className="h-4 w-4" />
-          </button>
+          {/* Send button — becomes an explicit Stop while a run executes.
+              Stop is the ONLY client action that cancels a run; closing or
+              refreshing the page never does. */}
+          {isStreaming ? (
+            <button
+              onClick={() => void stopActiveRun()}
+              className={cn(
+                "flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition-colors",
+                "bg-destructive text-destructive-foreground hover:opacity-90"
+              )}
+              aria-label="Stop the current run"
+              title="Stop the current run"
+            >
+              <Square className="h-3.5 w-3.5 fill-current" />
+            </button>
+          ) : (
+            <button
+              onClick={handleSend}
+              disabled={!inputDraft.trim()}
+              className={cn(
+                "flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition-colors",
+                "bg-primary text-primary-foreground",
+                "hover:bg-accent-hover",
+                "disabled:bg-muted disabled:text-muted-foreground disabled:cursor-not-allowed"
+              )}
+              aria-label="Send message"
+            >
+              <ArrowUp className="h-4 w-4" />
+            </button>
+          )}
         </div>
 
         {/* Composer action row */}

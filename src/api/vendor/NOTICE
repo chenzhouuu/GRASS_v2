@@ -1,0 +1,25 @@
+Vendored third-party code
+=========================
+
+aegra_broker.py
+---------------
+Copied from the Aegra project (Agent Protocol server for LangGraph):
+
+    Repository: https://github.com/aegra/aegra
+    Commit:     e72c0f5459bc6deb2df6bdfc08077cdf5ce02281 (fetched 2026-08-16)
+    Copyright:  Muhammad Ibrahim (@ibbybuilds) and Aegra contributors
+    License:    Apache License, Version 2.0
+                https://www.apache.org/licenses/LICENSE-2.0
+
+Upstream files copied (paths under libs/aegra-api/src/aegra_api/):
+    utils/sse_utils.py, models/enums.py (RunCancellationAction only),
+    core/active_runs.py, services/base_broker.py, services/broker.py
+
+Modifications made for GRASS (also listed in the file header):
+    - structlog replaced with stdlib logging
+    - aegra_api.* imports replaced with the copied definitions themselves
+    - the Redis backend selection branch removed (settings / RedisBrokerManager
+      are not vendored); only the in-memory BrokerManager remains
+
+This NOTICE file is provided to satisfy Section 4 (Redistribution) of the
+Apache License, Version 2.0.

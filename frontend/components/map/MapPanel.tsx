@@ -10,6 +10,7 @@ import {
 import L from "leaflet";
 import { useMapStore } from "@/stores/mapStore";
 import { useSettingsStore } from "@/stores/settingsStore";
+import { MapInitRecovery } from "./MapInitRecovery";
 import { MapMarkers } from "./MapMarkers";
 import { MapClusters } from "./MapClusters";
 import { MapRoutes } from "./MapRoutes";
@@ -263,29 +264,31 @@ export function MapPanel() {
 
   return (
     <div ref={containerRef} className="relative h-full w-full">
-      <MapContainer
-        center={viewport.center}
-        zoom={viewport.zoom}
-        zoomControl={false}
-        className="h-full w-full"
-        attributionControl={true}
-      >
-        <TileLayer
-          key={mapSettings.tileProvider}
-          attribution={tile.attribution}
-          url={tile.url}
-        />
-        <ZoomControl position="bottomright" />
-        <ViewportSync />
-        <AutoFitBounds />
-        {showMarkers && <MapMarkers />}
-        {showClusters && <MapClusters />}
-        {showRoutes && <MapRoutes />}
-        {showRoutes && <MapRoutesGeoJSON />}
-        <MapFocusRegion />
-        <MapControls />
-        <MapDrawTools active={isDrawing} onDone={handleDrawDone} />
-      </MapContainer>
+      <MapInitRecovery>
+        <MapContainer
+          center={viewport.center}
+          zoom={viewport.zoom}
+          zoomControl={false}
+          className="h-full w-full"
+          attributionControl={true}
+        >
+          <TileLayer
+            key={mapSettings.tileProvider}
+            attribution={tile.attribution}
+            url={tile.url}
+          />
+          <ZoomControl position="bottomright" />
+          <ViewportSync />
+          <AutoFitBounds />
+          {showMarkers && <MapMarkers />}
+          {showClusters && <MapClusters />}
+          {showRoutes && <MapRoutes />}
+          {showRoutes && <MapRoutesGeoJSON />}
+          <MapFocusRegion />
+          <MapControls />
+          <MapDrawTools active={isDrawing} onDone={handleDrawDone} />
+        </MapContainer>
+      </MapInitRecovery>
 
       <LayerPanel />
       <MapToolbar

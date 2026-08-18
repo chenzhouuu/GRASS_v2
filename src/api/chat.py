@@ -1,28 +1,39 @@
 """Chat API endpoint with SSE streaming.
 
-Handles chat messages, invokes the LangGraph workflow, and streams
-agent progress events to the frontend in real-time.
-
-Updated for Supervisor architecture: initial state uses new fields
-(next_worker, worker_task, supervisor_plan) instead of old ones
-(intent, plan, current_step_index, completed_steps, response).
+Backend-owned runs: POST /api/chat starts the graph in a background task that
+runs to completion whether or not any client is connected. Events flow through
+the vendored Aegra broker (live fan-out + replay buffer); GET /api/stream is a
+pure reader that can attach late, reattach with ``Last-Event-ID``, or be opened
+from several clients at once.
 """
 
+import asyncio
+import contextlib
 import inspect
+import json
 import logging
+import time
 import uuid
 from typing import AsyncGenerator, Dict, Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Header, HTTPException
+from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.types import Command
 from pydantic import BaseModel
 from sse_starlette import EventSourceResponse
 
+from ..core.events import GRASSEvent
 from ..core.graph import GRAPH_RECURSION_LIMIT
 from ..core.state import GRASSState, TURN_RESET_STATE
-from ..utils.nvl_transformer import records_to_nvl_graph
+from ..db import runs as run_store
 from ..utils.neo4j_serializer import to_jsonable as _to_jsonable
 from .sessions import append_message, ensure_session_exists, get_effective_session_model_config
+from .vendor.aegra_broker import (
+    active_runs,
+    broker_manager,
+    extract_event_sequence,
+    generate_event_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,19 +43,44 @@ router = APIRouter(prefix="/api", tags=["chat"])
 _graph = None
 _graph_factory = None
 
-# Store run_id -> message mapping (in production, use Redis or database)
-_active_runs: dict[str, dict] = {}
-_STALE_RUN_TTL = 600  # 10 minutes
+# Per-run request context the broker does not carry (session binding, plan-gate
+# flag). Event and replay lifetime is owned by the broker manager; entries here
+# are swept once the manager has dropped the corresponding broker.
+_run_meta: dict[str, dict] = {}
 
 
-def _cleanup_stale_runs() -> None:
-    """Remove runs older than TTL that were never streamed."""
-    import time
+# A run paused at the plan gate keeps its broker open on purpose (the
+# decision's continuation lands in the same stream). If no decision ever
+# comes, expire it so the broker + replay buffer don't live forever.
+_PAUSED_RUN_TTL_SECONDS = 3600
+
+
+async def _set_run_status_quiet(run_id: str, status: str, *, error: str | None = None) -> None:
+    """Best-effort status write: a DB hiccup must never take the run down."""
+    try:
+        await run_store.set_run_status(run_id, status, error=error)
+    except Exception:
+        logger.warning("Run %s: status %r not persisted", run_id, status, exc_info=True)
+
+
+async def _sweep_run_meta() -> None:
+    """Expire abandoned plan-gate pauses; drop metadata for reclaimed brokers."""
     now = time.time()
-    stale = [rid for rid, data in _active_runs.items()
-             if now - data.get("created_at", now) > _STALE_RUN_TTL]
-    for rid in stale:
-        del _active_runs[rid]
+    for rid, meta in list(_run_meta.items()):
+        if (
+            meta.get("awaiting_plan")
+            and now - meta.get("paused_at", now) > _PAUSED_RUN_TTL_SECONDS
+        ):
+            logger.info("Expiring abandoned plan-gate run %s", rid)
+            meta["awaiting_plan"] = False
+            await _set_run_status_quiet(
+                rid, "stopped", error="plan decision never arrived (TTL)"
+            )
+            broker = broker_manager.get_broker(rid)
+            if broker is not None:
+                broker.mark_finished()  # manager's cleanup loop reclaims it
+    for rid in [rid for rid in _run_meta if broker_manager.get_broker(rid) is None]:
+        del _run_meta[rid]
 
 
 def set_graph(graph):
@@ -96,98 +132,28 @@ class PlanDecisionRequest(BaseModel):
 
 def build_sse_event(event_type: str, data: Dict[str, Any]) -> Dict[str, str]:
     """Build an SSE event dict for EventSourceResponse."""
-    import json
     return {
         "event": event_type,
         "data": json.dumps(_to_jsonable(data)),
     }
 
 
-# -- progress-ledger SSE helpers ---------------------------------------------
+def _last_agent_text(messages: list) -> str | None:
+    """Text of the current turn's most recent assistant message, or None.
 
-_LEDGER_PHASE_BY_ROUTE = {
-    "dispatch": "executing",
-    "loop": "executing",
-    "replan": "replanning",
-    "finalize": "finalizing",
-}
-
-
-def _enabled_plan_steps(plan_steps: list[dict] | None) -> list[dict]:
-    """Return the steps the user left enabled (the executable subset)."""
-    if not plan_steps:
-        return []
-    return [s for s in plan_steps if s.get("enabled", True) is not False]
-
-
-def _build_ledger_progress(output: dict, plan_steps: list[dict] | None) -> dict | None:
-    """Build a ``progress`` payload from one Executor turn's state delta.
-
-    Maps the ledger's ``current_step_idx`` + ``plan_route`` onto a per-step
-    checklist (done / running / pending) plus the running progress summary,
-    so the frontend can render a live execution timeline.
+    ``messages`` is session-durable; the scan is sliced to after the last
+    HumanMessage so a turn that produced no text of its own cannot
+    re-deliver a previous turn's answer as the reply to a new question.
     """
-    enabled = _enabled_plan_steps(plan_steps)
-    if not enabled:
-        return None
-
-    route = output.get("plan_route")
-    idx = output.get("current_step_idx")
-    idx = 0 if idx is None else int(idx)
-    total = len(enabled)
-    phase = _LEDGER_PHASE_BY_ROUTE.get(route, "executing")
-    finalizing = phase == "finalizing"
-
-    steps: list[dict] = []
-    for i, step in enumerate(enabled):
-        if finalizing or i < idx:
-            status = "done"
-        elif i == idx:
-            status = "running"
-        else:
-            status = "pending"
-        steps.append({
-            "index": i + 1,
-            "title": step.get("title", ""),
-            "agent": step.get("agent", ""),
-            "status": status,
-        })
-
-    # The running summary accumulates as "\n- line"; surface the latest line.
-    raw_summary = (output.get("information_collected") or "").strip()
-    current_summary = ""
-    if raw_summary:
-        current_summary = raw_summary.splitlines()[-1].lstrip("- ").strip()
-
-    return {
-        "phase": phase,
-        "current_step": min(idx + 1, total),
-        "total_steps": total,
-        "summary": current_summary,
-        "steps": steps,
-    }
-
-
-def _final_ledger_progress(plan_steps: list[dict] | None) -> dict | None:
-    """All-steps-complete snapshot emitted when the Finalize node closes."""
-    enabled = _enabled_plan_steps(plan_steps)
-    if not enabled:
-        return None
-    return {
-        "phase": "complete",
-        "current_step": len(enabled),
-        "total_steps": len(enabled),
-        "summary": "",
-        "steps": [
-            {
-                "index": i + 1,
-                "title": s.get("title", ""),
-                "agent": s.get("agent", ""),
-                "status": "done",
-            }
-            for i, s in enumerate(enabled)
-        ],
-    }
+    last_human = -1
+    for i in range(len(messages) - 1, -1, -1):
+        if isinstance(messages[i], HumanMessage):
+            last_human = i
+            break
+    for msg in reversed(messages[last_human + 1:]):
+        if isinstance(msg, AIMessage) and isinstance(msg.content, str) and msg.content.strip():
+            return msg.content
+    return None
 
 
 async def _get_pending_interrupt(graph, config) -> Any | None:
@@ -212,175 +178,64 @@ async def _emit_graph_events(
     session_id: str,
     config: dict,
 ) -> AsyncGenerator[Dict[str, str], None]:
-    """Run the graph for ``graph_input`` and emit SSE events.
+    """Run the graph for ``graph_input`` and forward the events its nodes emit.
 
-    Shared by the initial stream (input = initial state) and the resume
-    stream (input = ``Command(resume=...)``). If the graph pauses at the
-    plan gate, emits ``plan`` + ``plan_pending`` and returns WITHOUT a
-    ``done`` event, keeping the run alive for a plan decision.
+    Nodes publish their own events through ``get_stream_writer()``
+    (``src/core/graph.py``), which arrive here as ``stream_mode="custom"``.
+    This function adds only what a node cannot know: the per-agent ``step_id``
+    the frontend correlates on, and the accumulators used to persist the
+    assistant message.
+
+    Shared by the initial run (input = initial state) and the resume run
+    (input = ``Command(resume=...)``). If the graph pauses at the plan gate,
+    emits ``plan_review`` + ``plan_pending`` and returns WITHOUT a ``done``
+    event, keeping the run alive for a plan decision.
     """
-    step_counter = 0
+    # Step ids must be monotonic per RUN, not per segment: a plan-decision
+    # resume re-enters this generator, and restarting at 1 would reuse ids
+    # the frontend already correlated cards on.
+    meta = _run_meta.setdefault(run_id, {})
     active_step_ids: dict[str, str] = {}
     final_response_markdown: str | None = None
     collected_chart_specs: list[dict] = []
     collected_geo_data: dict | None = None
-    # Plan steps for the ledger progress timeline (captured from the planner
-    # nodes; backfilled from persisted state if the plan predates this stream).
-    ledger_plan_steps: list[dict] | None = None
 
-    async for event in graph.astream_events(graph_input, config=config, version="v2"):
-        event_type = event.get("event")
-        name = event.get("name", "")
-        data = event.get("data", {})
+    async for _mode, chunk in graph.astream(
+        graph_input, config=config, stream_mode=["custom"]
+    ):
+        name = chunk.get("event")
+        payload = dict(chunk.get("data") or {})
+        agent = payload.get("agent")
 
-        # -- co-planning nodes: capture the plan + stream ledger progress ---
-        if event_type == "on_chain_end" and name in ("Planner", "PlanGate", "Replan"):
-            plan_obj = (data.get("output", {}) or {}).get("plan")
-            if isinstance(plan_obj, dict) and plan_obj.get("steps"):
-                ledger_plan_steps = plan_obj["steps"]
-            continue
+        if name == GRASSEvent.AGENT_START.value:
+            meta["step_counter"] = meta.get("step_counter", 0) + 1
+            step_id = f"{run_id}:{meta['step_counter']}"
+            active_step_ids[agent] = step_id
+            payload["step_id"] = step_id
+        elif name in (GRASSEvent.AGENT_COMPLETE.value, GRASSEvent.ERROR.value):
+            payload["step_id"] = active_step_ids.pop(agent, None)
+        elif name == GRASSEvent.RESPONSE.value:
+            final_response_markdown = payload.get("markdown")
+        elif name == GRASSEvent.CHART_SPEC.value:
+            collected_chart_specs.append(payload)
+        elif name == GRASSEvent.GEO_DATA.value:
+            collected_geo_data = payload.get("geojson")
 
-        if event_type == "on_chain_end" and name == "Executor":
-            output = data.get("output", {}) or {}
-            if ledger_plan_steps is None and hasattr(graph, "aget_state"):
-                snapshot = await graph.aget_state(config)
-                values = getattr(snapshot, "values", {}) or {}
-                plan_obj = values.get("plan")
-                if isinstance(plan_obj, dict):
-                    ledger_plan_steps = plan_obj.get("steps")
-            progress = _build_ledger_progress(output, ledger_plan_steps)
-            if progress is not None:
-                yield build_sse_event("progress", progress)
-            continue
-
-        if event_type == "on_chain_end" and name == "Finalize":
-            output = data.get("output", {}) or {}
-            response_md = output.get("response_markdown")
-            if response_md:
-                final_response_markdown = response_md
-                yield build_sse_event("response", {"markdown": response_md})
-            final_progress = _final_ledger_progress(ledger_plan_steps)
-            if final_progress is not None:
-                yield build_sse_event("progress", final_progress)
-            continue
-
-        if event_type == "on_chain_start" and name in [
-            "Supervisor", "Cypher", "Analytics", "Optimization", "Report", "ScenarioRunner"
-        ]:
-            step_counter += 1
-            step_id = f"{run_id}:{step_counter}"
-            active_step_ids[name] = step_id
-            yield build_sse_event("agent_start", {
-                "agent": name, "status": "running", "step_id": step_id,
-            })
-
-        elif event_type == "on_chain_end" and name in [
-            "Supervisor", "Cypher", "Analytics", "Optimization", "Report", "ScenarioRunner"
-        ]:
-            output = data.get("output", {})
-            step_id = active_step_ids.pop(name, None)
-
-            if name == "Supervisor":
-                plan = output.get("supervisor_plan")
-                if plan:
-                    yield build_sse_event("plan", {
-                        "intent": plan.get("intent", ""),
-                        "summary": plan.get("summary", ""),
-                        "steps": plan.get("steps", []),
-                        "requires_geo": plan.get("requires_geo", False),
-                        "requires_optimization": plan.get("requires_optimization", False),
-                    })
-                response_md = output.get("response_markdown")
-                if response_md:
-                    final_response_markdown = response_md
-                    yield build_sse_event("response", {"markdown": response_md})
-                geo_data = output.get("geo_data")
-                if geo_data and geo_data.get("features"):
-                    collected_geo_data = geo_data
-                    yield build_sse_event("geo_data", {"geojson": geo_data})
-
-            elif name == "Cypher":
-                cypher_query = output.get("cypher_query")
-                cypher_results = output.get("cypher_results") or []
-                if cypher_query:
-                    columns = list(cypher_results[0].keys()) if cypher_results else []
-                    graph_payload = records_to_nvl_graph(cypher_results)
-                    yield build_sse_event("cypher_query", {
-                        "query": cypher_query,
-                        "results": cypher_results,
-                        "columns": columns,
-                        "graph": graph_payload,
-                        "graph_truncated": graph_payload.get("stats", {}).get("truncated", False),
-                        "graph_warnings": graph_payload.get("warnings", []),
-                    })
-
-            elif name == "Analytics":
-                analysis_results = output.get("analysis_results")
-                if analysis_results:
-                    yield build_sse_event("analysis", {
-                        "summary": "Analysis complete", "results": analysis_results,
-                    })
-                chart_specs = output.get("chart_specs") or []
-                for i, spec in enumerate(chart_specs):
-                    chart_id = str(uuid.uuid4())
-                    collected_chart_specs.append({"id": chart_id, "index": i, "spec": spec})
-                    yield build_sse_event("chart_spec", {"id": chart_id, "index": i, "spec": spec})
-
-            elif name == "Optimization":
-                opt_solution = output.get("optimization_solution")
-                if opt_solution:
-                    yield build_sse_event("optimization", {
-                        "model": str(output.get("optimization_model", "")),
-                        "solution": opt_solution,
-                        "status": opt_solution.get("status", "unknown") if isinstance(opt_solution, dict) else "unknown",
-                    })
-                opt_charts = output.get("chart_specs") or []
-                for i, spec in enumerate(opt_charts):
-                    chart_id = str(uuid.uuid4())
-                    collected_chart_specs.append({"id": chart_id, "index": i, "spec": spec})
-                    yield build_sse_event("chart_spec", {"id": chart_id, "index": i, "spec": spec})
-                opt_geo = output.get("geo_data")
-                if opt_geo and opt_geo.get("features"):
-                    collected_geo_data = opt_geo
-                    yield build_sse_event("geo_data", {"geojson": opt_geo})
-
-            elif name == "Report":
-                report_file = output.get("report_file")
-                if report_file:
-                    file_id = report_file.split("/")[-1] if "/" in report_file else report_file
-                    yield build_sse_event("report", {
-                        "url": f"/api/files/{file_id}", "title": "Supply Chain Report",
-                    })
-
-            elif name == "ScenarioRunner":
-                comparison = output.get("scenario_comparison")
-                if comparison:
-                    yield build_sse_event("scenario_comparison", comparison)
-                sc_charts = output.get("chart_specs") or []
-                for i, spec in enumerate(sc_charts):
-                    chart_id = str(uuid.uuid4())
-                    collected_chart_specs.append({"id": chart_id, "index": i, "spec": spec})
-                    yield build_sse_event("chart_spec", {"id": chart_id, "index": i, "spec": spec})
-                sc_geo = output.get("geo_data")
-                if sc_geo and sc_geo.get("features"):
-                    collected_geo_data = sc_geo
-                    yield build_sse_event("geo_data", {"geojson": sc_geo})
-
-            yield build_sse_event("agent_complete", {
-                "agent": name, "status": "done", "step_id": step_id, "result": {},
-            })
-
-        elif event_type == "on_chain_error":
-            error_msg = str(data.get("error", "Unknown error"))
-            step_id = active_step_ids.pop(name, None)
-            yield build_sse_event("error", {
-                "agent": name, "step_id": step_id, "error": error_msg,
-            })
+        yield build_sse_event(name, payload)
 
     # -- co-planning pause: graph stopped at the plan gate --------------
     pending = await _get_pending_interrupt(graph, config)
     if pending is not None:
         payload = pending if isinstance(pending, dict) else {"plan_str": str(pending)}
+        # State first, announcement last: anyone reacting to ``plan_pending``
+        # (plan-decision POST, sweep, active-run discovery) must already see
+        # the paused state when the event reaches them. ``segment_paused`` is
+        # the driver's private copy of this segment's outcome — a fast
+        # decision can flip ``awaiting_plan`` back before the driver's own
+        # check runs, and the driver must still not close the broker.
+        meta["awaiting_plan"] = True
+        meta["segment_paused"] = True
+        meta["paused_at"] = time.time()
         yield build_sse_event("plan_review", {
             "run_id": run_id,
             "plan": payload.get("plan"),
@@ -389,9 +244,6 @@ async def _emit_graph_events(
             "message": payload.get("message", ""),
         })
         yield build_sse_event("plan_pending", {"run_id": run_id})
-        run_data = _active_runs.get(run_id)
-        if run_data is not None:
-            run_data["awaiting_plan"] = True
         return
 
     # -- normal completion ---------------------------------------------
@@ -401,6 +253,13 @@ async def _emit_graph_events(
         response_md = values.get("response_markdown")
         if isinstance(response_md, str) and response_md:
             final_response_markdown = response_md
+        else:
+            # A react run can end at a terminal worker (Report -> END) with the
+            # Supervisor never writing the final answer. Fall back to the last
+            # agent message so the run still delivers and persists a reply.
+            final_response_markdown = _last_agent_text(values.get("messages") or [])
+            if final_response_markdown:
+                yield build_sse_event("response", {"markdown": final_response_markdown})
 
     if final_response_markdown:
         msg_metadata: dict | None = None
@@ -422,22 +281,237 @@ async def _emit_graph_events(
                 ]
             if collected_geo_data:
                 msg_metadata["geo_data"] = collected_geo_data
-        await append_message(
-            session_id, role="assistant", content=final_response_markdown,
-            run_id=run_id, metadata=msg_metadata,
-        )
+        # Flag BEFORE the await: the DB commit happens inside the await, so a
+        # cancellation "during" the await can land after the row is written —
+        # the flag keeps _persist_partial_response from appending it twice.
+        # A genuine write failure rolls the flag back so the fallback still runs.
+        meta["persisted"] = True
+        try:
+            await append_message(
+                session_id, role="assistant", content=final_response_markdown,
+                run_id=run_id, metadata=msg_metadata,
+            )
+        except asyncio.CancelledError:
+            raise  # commit may still have landed; keep the flag
+        except Exception:
+            meta["persisted"] = False
+            raise
 
     yield build_sse_event("done", {})
-    if run_id in _active_runs:
-        del _active_runs[run_id]
 
+
+# -- Startup recovery ---------------------------------------------------------
+
+
+async def startup_run_recovery() -> None:
+    """Reconcile the runs table with reality after a process (re)start.
+
+    A run whose status is non-terminal here died with the previous process
+    life: mark it failed, and salvage what its event stream already carried —
+    a published ``response`` becomes the persisted answer; otherwise an error
+    message tells the user why there is no reply. Also drops run events past
+    the 7-day retention window.
+    """
+    orphans = await run_store.find_orphan_runs()
+    for run in orphans:
+        salvaged: str | None = None
+        for _seq, event_name, data in reversed(
+            await run_store.load_run_events(run.id)
+        ):
+            if event_name == GRASSEvent.RESPONSE.value:
+                try:
+                    salvaged = json.loads(data).get("markdown")
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+                break
+        await run_store.set_run_status(run.id, "failed", error="backend restarted")
+        if not await run_store.has_assistant_message(run.id):
+            await append_message(
+                run.session_id,
+                role="assistant",
+                content=salvaged
+                or "Error: the backend restarted while this run was in "
+                "progress. Please send your question again.",
+                run_id=run.id,
+            )
+        logger.info(
+            "Orphaned run %s marked failed (salvaged response: %s)",
+            run.id,
+            bool(salvaged),
+        )
+
+    expired = await run_store.delete_expired_run_events()
+    if orphans or expired:
+        logger.info(
+            "Run recovery: %d orphan(s) failed, %d expired event(s) dropped",
+            len(orphans),
+            expired,
+        )
+
+
+# -- Background run driver ----------------------------------------------------
+
+
+async def _persist_partial_response(graph, config, session_id: str, run_id: str) -> None:
+    """Persist whatever answer the checkpoint already holds.
+
+    Read from the checkpoint, not from generator locals — those die with the
+    cancelled task.
+    """
+    if graph is None or not hasattr(graph, "aget_state"):
+        return
+    if _run_meta.get(run_id, {}).get("persisted"):
+        return  # the normal completion path already wrote this answer
+    snapshot = await graph.aget_state(config)
+    response_md = (getattr(snapshot, "values", {}) or {}).get("response_markdown")
+    if isinstance(response_md, str) and response_md:
+        await append_message(
+            session_id, role="assistant", content=response_md, run_id=run_id
+        )
+
+
+async def _drive_run(run_id: str, session_id: str, graph_input) -> None:
+    """Own a run start-to-finish, independent of any connected client.
+
+    Forwards every SSE event to the run's broker (live fan-out + replay
+    buffer). Assistant persistence happens inside ``_emit_graph_events``, so
+    it too is client-independent. On cancellation, persists what the
+    checkpoint already holds and re-raises.
+    """
+    broker = broker_manager.get_or_create_broker(run_id)
+
+    async def publish(event: Dict[str, str]) -> None:
+        event_id = await broker_manager.allocate_event_id(run_id)
+        await broker.put(event_id, event)
+        # Write-through: the durable copy replay reads after a broker is gone
+        # (process restart, reclaimed broker). A failed write must not take
+        # the run down — live viewers are unaffected.
+        try:
+            await run_store.record_run_event(
+                run_id,
+                extract_event_sequence(event_id),
+                event.get("event", ""),
+                event.get("data", ""),
+            )
+        except Exception:
+            logger.warning(
+                "Run %s: event %s not persisted", run_id, event_id, exc_info=True
+            )
+
+    graph = None
+    config = {
+        "configurable": {"thread_id": session_id},
+        "recursion_limit": GRAPH_RECURSION_LIMIT,
+    }
+    try:
+        graph = await _resolve_graph(session_id)
+        if graph is None:
+            raise RuntimeError("LangGraph not initialized")
+
+        if not isinstance(graph_input, Command):
+            # Fresh run: tell viewers which model config is active.
+            try:
+                effective_config = await get_effective_session_model_config(session_id)
+                await publish(build_sse_event("config_applied", {
+                    "agent_models": effective_config.get("agent_models", {}),
+                }))
+            except Exception:
+                pass  # Non-critical — don't block chat if config lookup fails
+
+        async for event in _emit_graph_events(
+            graph, graph_input, run_id, session_id, config
+        ):
+            await publish(event)
+    except asyncio.CancelledError:
+        # mark_finished must run even if the awaits below are themselves
+        # cancelled (loop shutdown), or the broker is never reclaimed.
+        try:
+            with contextlib.suppress(Exception):
+                await _persist_partial_response(graph, config, session_id, run_id)
+            with contextlib.suppress(Exception):
+                await publish(build_sse_event("done", {}))
+            await _set_run_status_quiet(run_id, "stopped")
+        finally:
+            broker.mark_finished()
+        raise
+    except Exception as e:
+        logger.error("Run %s failed: %s", run_id, e, exc_info=True)
+        with contextlib.suppress(Exception):
+            await append_message(
+                session_id, role="assistant", content=f"Error: {e}", run_id=run_id
+            )
+        await publish(build_sse_event("error", {"agent": "System", "error": str(e)}))
+        await publish(build_sse_event("done", {}))
+        await _set_run_status_quiet(run_id, "failed", error=str(e))
+        broker.mark_finished()
+        return
+
+    meta = _run_meta.get(run_id)
+    if meta is not None and meta.pop("segment_paused", False):
+        # This segment ended at the plan gate: the broker stays open so the
+        # decision's continuation lands in the same stream. Skip the status
+        # write if a decision already resumed the run in the meantime.
+        if meta.get("awaiting_plan"):
+            await _set_run_status_quiet(run_id, "awaiting_plan")
+        return
+    await _set_run_status_quiet(run_id, "completed")
+    broker.mark_finished()
+
+
+def _start_run_task(run_id: str, session_id: str, graph_input) -> None:
+    """Spawn the background driver and register it for cancellation."""
+    task = asyncio.create_task(_drive_run(run_id, session_id, graph_input))
+    active_runs[run_id] = task
+
+    def _clear(finished: asyncio.Task, run_id: str = run_id) -> None:
+        if active_runs.get(run_id) is finished:
+            del active_runs[run_id]
+
+    task.add_done_callback(_clear)
+
+
+async def _broker_events(
+    run_id: str, last_event_id: str | None
+) -> AsyncGenerator[Dict[str, str], None]:
+    """Follow a run's broker from a cursor; frames carry ``id:`` for reconnect.
+
+    The vendored ``aiter()`` replays the whole buffer to every new subscriber
+    and callers dedup by event id (upstream contract) — the sequence filter
+    here is that dedup, and it also implements ``Last-Event-ID``. A
+    ``plan_pending`` event closes the view: the run is paused for a human
+    decision, and the continuation is watched via the plan-decision response.
+    """
+    broker = broker_manager.get_broker(run_id)
+    cursor = extract_event_sequence(last_event_id) if last_event_id else 0
+    if broker is None:
+        # The broker died with the previous process life (or was reclaimed):
+        # replay the durable copy. The run itself is over — no live tail.
+        for seq, event_name, data in await run_store.load_run_events(
+            run_id, after_seq=cursor
+        ):
+            yield {
+                "event": event_name,
+                "data": data,
+                "id": generate_event_id(run_id, seq),
+            }
+        return
+    async for event_id, event in broker.aiter():
+        if extract_event_sequence(event_id) <= cursor:
+            continue
+        yield {**event, "id": event_id}
+        if event.get("event") == "plan_pending":
+            return
 
 
 # -- Main chat endpoint -------------------------------------------------------
 
 @router.post("/chat", response_model=ChatResponse)
 async def create_chat(body: ChatRequest):
-    """Initiate a chat run and return run_id for SSE streaming."""
+    """Start a chat run owned by the backend.
+
+    The graph executes in a background task and runs to completion whether or
+    not any client watches; ``GET /api/stream/{run_id}`` only observes it.
+    """
     if not body.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty")
 
@@ -447,6 +521,22 @@ async def create_chat(body: ChatRequest):
     run_id = str(uuid.uuid4())
     session = await ensure_session_exists(body.session_id)
     session_id = session["id"]
+
+    # One executing run per session thread: two concurrent graph executions
+    # on the same thread_id interleave checkpoint writes and each wipes the
+    # other's transients via TURN_RESET_STATE. (A run paused at the plan
+    # gate has no live task, so a new message is still allowed then.)
+    for rid, meta in list(_run_meta.items()):
+        if meta.get("session_id") != session_id:
+            continue
+        task = active_runs.get(rid)
+        if task is not None and not task.done():
+            raise HTTPException(
+                status_code=409,
+                detail=f"Session already has a run in progress ({rid}); "
+                "wait for it to finish.",
+            )
+
     await append_message(
         session_id,
         role="user",
@@ -454,16 +544,33 @@ async def create_chat(body: ChatRequest):
         run_id=run_id,
     )
 
-    import time as _time
-    _cleanup_stale_runs()
-    _active_runs[run_id] = {
-        "session_id": session_id,
-        "message": body.message,
+    if body.region_bbox:
+        user_message_with_region = (
+            f"{body.message}\n\n"
+            f"Region focus (bbox sw_lat,sw_lng,ne_lat,ne_lng): [{body.region_bbox}]. "
+            "Prioritize analysis within this region unless user asks otherwise."
+        )
+    else:
+        user_message_with_region = body.message
+
+    # Initial state — per-turn transients are reset centrally via
+    # TURN_RESET_STATE (src/core/state.py) so checkpointed values from
+    # the previous turn cannot leak into this one.
+    initial_state: GRASSState = {
+        **TURN_RESET_STATE,
+        "messages": [HumanMessage(content=user_message_with_region)],
+        "user_query": user_message_with_region,
         "region_bbox": body.region_bbox,
+        "session_id": session_id,
+        # Co-planning mode (default "direct")
         "mode": body.mode or "direct",
-        "stream_started": False,
-        "created_at": _time.time(),
     }
+
+    await _sweep_run_meta()
+    await run_store.create_run(run_id, session_id)
+    _run_meta[run_id] = {"session_id": session_id, "awaiting_plan": False}
+    broker_manager.get_or_create_broker(run_id)
+    _start_run_task(run_id, session_id, initial_state)
 
     logger.info("Created chat run %s for session %s", run_id, session_id)
 
@@ -480,132 +587,121 @@ _ACCEPT_DECISIONS = {"accept", "accepted", "approve", "approved", "run", "execut
 async def submit_plan_decision(body: PlanDecisionRequest):
     """Resume a paused co-planning run with the human's decision.
 
-    Builds the ``HumanInputFormat`` resume payload (accept / edit / revise),
-    resumes the graph via ``Command(resume=...)``, and streams the
-    continuation (which may pause again at the gate after a replan).
+    Builds the ``HumanInputFormat`` resume payload (accept / edit / revise) and
+    resumes the graph via ``Command(resume=...)`` in a background task on the
+    run's existing broker. The response is a view of the continuation from the
+    current cursor (which may pause again at the gate after a replan).
     """
-    run_data = _active_runs.get(body.run_id)
-    if not run_data:
+    meta = _run_meta.get(body.run_id)
+    if not meta or not meta.get("awaiting_plan"):
         raise HTTPException(
             status_code=404, detail="Run not found or no longer awaiting a plan decision"
         )
 
-    session_id = run_data["session_id"]
+    session_id = meta["session_id"]
     accepted = body.decision.strip().lower() in _ACCEPT_DECISIONS
     resume_value: dict[str, Any] = {"accepted": accepted, "content": body.content or ""}
     if body.steps:
         # Edited plan from the frontend; Plan.from_obj accepts agent/agent_name.
         resume_value["plan"] = {"steps": body.steps}
 
-    run_data["awaiting_plan"] = False
+    meta["awaiting_plan"] = False
     logger.info(
         "Resuming run %s with plan decision: accepted=%s, edited=%s",
         body.run_id, accepted, bool(body.steps),
     )
 
-    async def resume_generator() -> AsyncGenerator[Dict[str, str], None]:
-        try:
-            graph = await _resolve_graph(session_id)
-            if graph is None:
-                raise RuntimeError("LangGraph not initialized")
-            config = {
-                "configurable": {"thread_id": session_id},
-                "recursion_limit": GRAPH_RECURSION_LIMIT,
-            }
-            async for event in _emit_graph_events(
-                graph, Command(resume=resume_value), body.run_id, session_id, config
-            ):
-                yield event
-        except Exception as e:  # noqa: BLE001 - surface to client
-            logger.error("Resume error for run %s: %s", body.run_id, e, exc_info=True)
-            yield build_sse_event("error", {"agent": "System", "error": str(e)})
-            yield build_sse_event("done", {})
-            if body.run_id in _active_runs:
-                del _active_runs[body.run_id]
+    cursor = generate_event_id(
+        body.run_id, await broker_manager.get_event_sequence(body.run_id)
+    )
+    await _set_run_status_quiet(body.run_id, "running")
+    _start_run_task(body.run_id, session_id, Command(resume=resume_value))
+    return EventSourceResponse(_broker_events(body.run_id, cursor))
 
-    return EventSourceResponse(resume_generator())
+
+@router.get("/sessions/{session_id}/active-run")
+async def get_active_run(session_id: str):
+    """The session's live run — executing or paused at the plan gate — or null.
+
+    Lets a client that just loaded a session discover and re-attach to a run
+    it does not know about (page refresh, second tab). ``last_event_id`` is
+    the current replay cursor; a fresh viewer usually omits it to get the
+    full backlog.
+    """
+    for rid, meta in list(_run_meta.items()):
+        if meta.get("session_id") != session_id:
+            continue
+        task = active_runs.get(rid)
+        running = task is not None and not task.done()
+        if not running and not meta.get("awaiting_plan"):
+            continue
+        return {
+            "run_id": rid,
+            "status": "running" if running else "awaiting_plan",
+            "last_event_id": generate_event_id(
+                rid, await broker_manager.get_event_sequence(rid)
+            ),
+        }
+    return None
+
+
+# Policy, not an accident: a viewer disconnecting NEVER stops a run —
+# viewing is not owning. The ONLY client-initiated cancellation is the
+# explicit stop endpoint below (upstream equivalent: stream.stop() vs
+# disconnect() ≡ stop({cancel: false})).
+DISCONNECT_STOPS_RUN = False
+
+
+@router.post("/chat/{run_id}/stop")
+async def stop_chat(run_id: str):
+    """Cancel a backend-owned run explicitly.
+
+    Cancellation drives ``_drive_run``'s CancelledError path: the partial
+    answer already in the checkpoint is persisted, viewers get ``done``,
+    and the broker is marked finished. Stopping a finished run is a no-op.
+    """
+    meta = _run_meta.get(run_id)
+    if meta is None and broker_manager.get_broker(run_id) is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    if meta is not None and meta.get("awaiting_plan"):
+        # Paused at the plan gate: no live task — abandoning it just
+        # closes out the broker.
+        meta["awaiting_plan"] = False
+        await _set_run_status_quiet(run_id, "stopped")
+        broker = broker_manager.get_broker(run_id)
+        if broker is not None:
+            broker.mark_finished()
+        logger.info("Stopped plan-paused run %s", run_id)
+        return {"run_id": run_id, "status": "stopped"}
+
+    task = active_runs.get(run_id)
+    if task is None or task.done():
+        return {"run_id": run_id, "status": "already_finished"}
+
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    logger.info("Stopped run %s by request", run_id)
+    return {"run_id": run_id, "status": "stopped"}
 
 
 @router.get("/stream/{run_id}")
-async def stream_chat(run_id: str):
-    """Stream agent progress events via SSE."""
+async def stream_chat(
+    run_id: str,
+    last_event_id: str | None = Header(None, alias="Last-Event-ID"),
+):
+    """Watch a run. A pure reader: attach late, reattach with a cursor, open
+    several at once — none of it affects the run itself."""
+    if broker_manager.get_broker(run_id) is None:
+        # No live broker — still serve the durable record if the run existed
+        # (finished long ago, or died with a previous process life).
+        if await run_store.get_run(run_id) is None:
+            raise HTTPException(status_code=404, detail="Run not found")
 
-    run_data = _active_runs.get(run_id)
-    if not run_data:
-        raise HTTPException(status_code=404, detail="Run not found")
-    if run_data.get("stream_started"):
-        raise HTTPException(status_code=409, detail="Run is already streaming")
+    async def _on_client_close(message: Dict[str, Any]) -> None:
+        logger.info("Viewer for run %s disconnected; run continues", run_id)
 
-    run_data["stream_started"] = True
-
-    user_message = run_data["message"]
-    region_bbox = run_data.get("region_bbox")
-    session_id = run_data["session_id"]
-    if region_bbox:
-        user_message_with_region = (
-            f"{user_message}\n\n"
-            f"Region focus (bbox sw_lat,sw_lng,ne_lat,ne_lng): [{region_bbox}]. "
-            "Prioritize analysis within this region unless user asks otherwise."
-        )
-    else:
-        user_message_with_region = user_message
-
-    async def event_generator() -> AsyncGenerator[Dict[str, str], None]:
-        """Generate SSE events from LangGraph execution."""
-
-        try:
-            from langchain_core.messages import HumanMessage
-            graph = await _resolve_graph(session_id)
-            if graph is None:
-                raise RuntimeError("LangGraph not initialized")
-
-            # Emit effective model config so frontend can confirm which models are active
-            try:
-                effective_config = await get_effective_session_model_config(session_id)
-                yield build_sse_event("config_applied", {
-                    "agent_models": effective_config.get("agent_models", {}),
-                })
-            except Exception:
-                pass  # Non-critical — don't block chat if config lookup fails
-
-            # Initial state — per-turn transients are reset centrally via
-            # TURN_RESET_STATE (src/core/state.py) so checkpointed values from
-            # the previous turn cannot leak into this one.
-            initial_state: GRASSState = {
-                **TURN_RESET_STATE,
-                "messages": [HumanMessage(content=user_message_with_region)],
-                "user_query": user_message_with_region,
-                "region_bbox": region_bbox,
-                "session_id": session_id,
-                # Co-planning mode (default "direct")
-                "mode": run_data.get("mode", "direct"),
-            }
-
-            config = {
-                "configurable": {"thread_id": session_id},
-                "recursion_limit": GRAPH_RECURSION_LIMIT,
-            }
-            async for event in _emit_graph_events(
-                graph, initial_state, run_id, session_id, config
-            ):
-                yield event
-
-        except Exception as e:
-            logger.error(f"Stream error for run {run_id}: {e}", exc_info=True)
-            await append_message(
-                session_id,
-                role="assistant",
-                content=f"Error: {e}",
-                run_id=run_id,
-            )
-            yield build_sse_event("error", {
-                "agent": "System",
-                "error": str(e),
-            })
-            yield build_sse_event("done", {})
-
-            # Clean up on error
-            if run_id in _active_runs:
-                del _active_runs[run_id]
-
-    return EventSourceResponse(event_generator())
+    return EventSourceResponse(
+        _broker_events(run_id, last_event_id),
+        client_close_handler_callable=_on_client_close,
+    )

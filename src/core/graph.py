@@ -11,8 +11,11 @@ from typing import Any, Callable
 
 from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.config import get_stream_writer
+from langgraph.errors import GraphBubbleUp
 from langgraph.graph import StateGraph, START, END
 
+from .events import GRASSEvent, executor_events, finalize_events, node_events
 from .state import GRASSState
 from .router import (
     supervisor_router,
@@ -39,33 +42,100 @@ GRAPH_RECURSION_LIMIT = 60
 
 # -- stub node factory -----------------------------------------------
 
-def _make_stub(name: str) -> Callable[[GRASSState], dict[str, Any]]:
-    """Return a pass-through node that logs and returns a placeholder."""
+class _StubAgent:
+    """Stand-in for an agent that is not wired yet.
 
-    def stub(state: GRASSState) -> dict[str, Any]:
-        logger.info("STUB node: %s (not yet implemented)", name)
+    Registered through :func:`_wrap_agent` exactly like a real agent, so an
+    unwired node still appears on the execution timeline instead of running
+    invisibly.
+    """
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def invoke(self, state: GRASSState) -> dict[str, Any]:
+        logger.info("STUB node: %s (not yet implemented)", self.name)
         return {
             "messages": [
                 AIMessage(
-                    content=f"[{name} agent not yet implemented]",
-                    name=name,
+                    content=f"[{self.name} agent not yet implemented]",
+                    name=self.name,
                 )
             ],
-            "sender": name,
+            "sender": self.name,
         }
-
-    stub.__name__ = f"stub_{name}"
-    return stub
 
 
 # -- node wrappers ----------------------------------------------------
 
+def _publish_error(writer, name: str, exc: Exception) -> None:
+    """Attribute a node failure to the node, not to the run as a whole."""
+    writer({
+        "event": GRASSEvent.ERROR.value,
+        "data": {"agent": name, "error": str(exc)},
+    })
+
+
 def _wrap_agent(agent, name: str) -> Callable[[GRASSState], dict[str, Any]]:
-    """Wrap an agent's invoke() into a LangGraph node function."""
+    """Wrap an agent's invoke() into a LangGraph node function.
+
+    The node publishes its own SSE events through ``get_stream_writer()``, which
+    reaches the API layer as ``stream_mode="custom"``.  Transport-level fields
+    (``step_id``) are stamped downstream; a node only says what happened.
+    """
 
     def node_fn(state: GRASSState) -> dict[str, Any]:
         logger.info("Running node: %s", name)
-        return agent.invoke(state)
+        writer = get_stream_writer()
+        writer({
+            "event": GRASSEvent.AGENT_START.value,
+            "data": {"agent": name, "status": "running"},
+        })
+        try:
+            output = agent.invoke(state)
+        except GraphBubbleUp:
+            # interrupt() / delegate / parent command — control flow, not failure.
+            raise
+        except Exception as exc:
+            _publish_error(writer, name, exc)
+            raise
+        for event_name, payload in node_events(name, output):
+            writer({"event": event_name, "data": payload})
+        writer({
+            "event": GRASSEvent.AGENT_COMPLETE.value,
+            "data": {"agent": name, "status": "done", "result": {}},
+        })
+        return output
+
+    node_fn.__name__ = f"node_{name}"
+    return node_fn
+
+
+def _wrap_ledger_node(
+    inner: Callable[[GRASSState], dict[str, Any]],
+    name: str,
+    mapper: Callable[[dict, dict], list[tuple[str, dict]]],
+) -> Callable[[GRASSState], dict[str, Any]]:
+    """Wrap a plan-mode node so it publishes its progress/response events.
+
+    Unlike workers, these nodes carry no agent lifecycle in the UI — they only
+    contribute the execution timeline and the final answer.  They do report
+    their own failures, so a broken Executor is named as such rather than
+    surfacing as a generic run error.
+    """
+
+    def node_fn(state: GRASSState) -> dict[str, Any]:
+        writer = get_stream_writer()
+        try:
+            output = inner(state)
+        except GraphBubbleUp:
+            raise
+        except Exception as exc:
+            _publish_error(writer, name, exc)
+            raise
+        for event_name, payload in mapper(state, output):
+            writer({"event": event_name, "data": payload})
+        return output
 
     node_fn.__name__ = f"node_{name}"
     return node_fn
@@ -103,26 +173,17 @@ def build_graph(
     workflow = StateGraph(GRASSState)
 
     # -- register nodes (5 total) -------------------------------------
-    workflow.add_node(
-        "Supervisor",
-        _wrap_agent(supervisor_agent, "Supervisor") if supervisor_agent else _make_stub("Supervisor"),
-    )
-    workflow.add_node(
-        "Cypher",
-        _wrap_agent(cypher_agent, "Cypher") if cypher_agent else _make_stub("Cypher"),
-    )
-    workflow.add_node(
-        "Analytics",
-        _wrap_agent(analytics_agent, "Analytics") if analytics_agent else _make_stub("Analytics"),
-    )
-    workflow.add_node(
-        "Optimization",
-        _wrap_agent(optimization_agent, "Optimization") if optimization_agent else _make_stub("Optimization"),
-    )
-    workflow.add_node(
-        "Report",
-        _wrap_agent(report_agent, "Report") if report_agent else _make_stub("Report"),
-    )
+    for node_name, agent in (
+        ("Supervisor", supervisor_agent),
+        ("Cypher", cypher_agent),
+        ("Analytics", analytics_agent),
+        ("Optimization", optimization_agent),
+        ("Report", report_agent),
+    ):
+        workflow.add_node(
+            node_name,
+            _wrap_agent(agent if agent else _StubAgent(node_name), node_name),
+        )
 
     # -- what-if scenario runner (only when wired) --------------------
     # Dormant until the Supervisor/Planner can dispatch to it (P4); when
@@ -142,8 +203,14 @@ def build_graph(
     # Ledger execution requires BOTH a planner (the gate) and an executor.
     ledger_enabled = planner_agent is not None and executor_agent is not None
     if ledger_enabled:
-        workflow.add_node("Executor", executor_agent.ledger_node)
-        workflow.add_node("Finalize", executor_agent.finalize_node)
+        workflow.add_node(
+            "Executor",
+            _wrap_ledger_node(executor_agent.ledger_node, "Executor", executor_events),
+        )
+        workflow.add_node(
+            "Finalize",
+            _wrap_ledger_node(executor_agent.finalize_node, "Finalize", finalize_events),
+        )
 
     # -- edges --------------------------------------------------------
     # Entry

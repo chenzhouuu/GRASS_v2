@@ -4,10 +4,10 @@ Provides direct access to Neo4j for Cypher queries and schema inspection.
 """
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 from ..tools.cypher_gateway import (
     get_cypher_gateway,
@@ -18,6 +18,7 @@ from ..utils.neo4j_connection import (
     apply_runtime_neo4j_config,
     get_neo4j_runtime_state,
 )
+from ..utils.nvl_transformer import records_to_nvl_graph
 from ..utils.schema_loader import fetch_schema_from_db
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,38 @@ router = APIRouter(prefix="/api", tags=["database"])
 class CypherRequest(BaseModel):
     query: str
     params: Optional[Dict[str, Any]] = None
+    format: Literal["table", "both"] = "both"
+
+
+class NvlGraphNode(BaseModel):
+    id: str
+    labels: List[str] = Field(default_factory=list)
+    caption: Optional[str] = None
+    properties: Dict[str, Any] = Field(default_factory=dict)
+
+
+class NvlGraphRelationship(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str
+    from_: str = Field(alias="from")
+    to: str
+    type: Optional[str] = None
+    caption: Optional[str] = None
+    properties: Dict[str, Any] = Field(default_factory=dict)
+
+
+class NvlGraphStats(BaseModel):
+    nodeCount: int
+    relationshipCount: int
+    truncated: bool = False
+
+
+class NvlGraphResult(BaseModel):
+    nodes: List[NvlGraphNode]
+    relationships: List[NvlGraphRelationship]
+    stats: NvlGraphStats
+    warnings: List[str] = Field(default_factory=list)
 
 
 class CypherResponse(BaseModel):
@@ -38,8 +71,11 @@ class CypherResponse(BaseModel):
     execution_time_ms: int
     error: Optional[str] = None
     truncated: bool = False
+    graph: Optional[NvlGraphResult] = None
+    graph_truncated: bool = False
+    graph_warnings: List[str] = Field(default_factory=list)
     source: str = "direct"
-    validation_warnings: List[str] = []
+    validation_warnings: List[str] = Field(default_factory=list)
 
 
 class CypherValidationRequest(BaseModel):
@@ -154,12 +190,23 @@ async def execute_cypher_query(body: CypherRequest):
             result.execution_time_ms,
         )
 
+    graph_payload = None
+    graph_truncated = False
+    graph_warnings: list[str] = []
+    if body.format == "both" and result.error is None:
+        graph_payload = records_to_nvl_graph(result.records)
+        graph_truncated = bool(graph_payload.get("stats", {}).get("truncated", False))
+        graph_warnings = list(graph_payload.get("warnings", []))
+
     return CypherResponse(
         results=result.records,
         columns=result.columns,
         execution_time_ms=result.execution_time_ms or 0,
         error=result.error,
         truncated=result.truncated,
+        graph=graph_payload,
+        graph_truncated=graph_truncated,
+        graph_warnings=graph_warnings,
         source=result.source,
         validation_warnings=result.validation.warnings if result.validation else [],
     )

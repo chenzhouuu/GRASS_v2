@@ -10,6 +10,7 @@ import { KeyboardHelp } from "./KeyboardHelp";
 import { ChatPanel } from "@/components/chat/ChatPanel";
 import { SettingsDialog } from "@/components/settings/SettingsDialog";
 import { OnboardingOverlay } from "@/components/onboarding/OnboardingOverlay";
+import { applyDashboardDrilldown } from "@/lib/dashboardDrilldown";
 import { fetchNeo4jConfig } from "@/lib/neo4j";
 import { useAppStore } from "@/stores/appStore";
 import { useSettingsStore } from "@/stores/settingsStore";
@@ -74,6 +75,16 @@ function AppContent() {
   }, [toggleSidebar, setActiveTab]);
 
   usePreferencesSync();
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const rightTab = params.get("rightTab");
+    const cypher = params.get("cypher");
+    if (rightTab && cypher) {
+      applyDashboardDrilldown({ rightTab, cypher });
+      window.history.replaceState({}, "", "/");
+    }
+  }, []);
 
   // ── Neo4j connection check on mount ─────────────────────────────────────
   useEffect(() => {

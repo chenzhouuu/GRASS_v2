@@ -35,9 +35,35 @@ def validate_cypher(
     """Validate a Cypher query without executing it.
 
     Use this before calling ``execute_read_cypher``.  The validator enforces
-    GRASS's read-only retrieval policy and checks known labels/relationships.
+    GRASS's read-only retrieval policy, checks known labels/relationships,
+    and compiles the query server-side via ``EXPLAIN``.
     """
-    return validate_cypher_query(query, require_read_only=True).model_dump()
+    report = validate_cypher_query(query, require_read_only=True).model_dump()
+    if not report.get("valid"):
+        return report
+
+    # Server-side compile check: EXPLAIN plans the query without running
+    # it, catching syntax the static validator cannot (e.g. SQL window
+    # functions like `SUM(...) OVER (PARTITION BY ...)`, which previously
+    # passed validation and burned an execute+regenerate cycle).
+    target = report.get("normalized_query") or query
+    explain = get_cypher_gateway().read_cypher(f"EXPLAIN {target}")
+    if explain.error:
+        # Only Statement-class errors indict the query itself. Other
+        # Neo.ClientError classes (Security.*, Database.*, Transaction.*)
+        # mean auth/config trouble — failing the query there would send
+        # the agent rewriting correct Cypher instead of surfacing an
+        # operational problem.
+        if "Neo.ClientError.Statement" in explain.error:
+            report["valid"] = False
+            report["errors"] = list(report.get("errors") or []) + [
+                f"Server-side EXPLAIN rejected the query: {explain.error}"
+            ]
+        else:
+            report["warnings"] = list(report.get("warnings") or []) + [
+                f"EXPLAIN check unavailable: {explain.error}"
+            ]
+    return report
 
 
 @tool

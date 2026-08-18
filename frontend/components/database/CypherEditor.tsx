@@ -164,7 +164,7 @@ export function CypherEditor() {
       const res = await fetch(apiUrl("/api/cypher"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query }),
+        body: JSON.stringify({ query, format: "both" }),
       });
       const data = await res.json();
       const elapsed = Math.round(performance.now() - startTime);
@@ -173,8 +173,14 @@ export function CypherEditor() {
         query,
         columns: data.columns ?? [],
         rows: data.results ?? data.rows ?? [],
-        executionTimeMs: elapsed,
+        executionTimeMs: data.execution_time_ms ?? elapsed,
         error: data.error,
+        truncated: data.truncated,
+        source: data.source,
+        validationWarnings: data.validation_warnings ?? [],
+        graph: data.graph ?? null,
+        graphTruncated: data.graph_truncated,
+        graphWarnings: data.graph_warnings ?? [],
       };
 
       setResults(result);

@@ -66,6 +66,27 @@ replications) and of the OR/ML literature itself.
    the user to run the manual test and confirm before starting the next
    step. Automated tests passing does NOT waive this gate.
 
+## Testing cost policy (mandatory, added 2026-08-17)
+
+1. **Default test runs must not burn tokens.** `pytest.ini` sets
+   `addopts = -m "not llm"` and `testpaths = tests`: a plain
+   `python -m pytest` runs only free tests (fake graphs, stub agents,
+   mocked models, local Neo4j). Every test that makes a real LLM API call is
+   auto-marked `llm` by `tests/conftest.py::pytest_collection_modifyitems`
+   (trigger: the `openai_available` fixture). New real-API tests must use
+   that fixture so they are excluded automatically — never add one that
+   calls a model without it.
+2. **Token-burning verification is manual-gate work.** Run `llm` tests only
+   when the user asks for them or as part of a manual verification step,
+   explicitly and narrowly: `python -m pytest -m llm` (or a single test node
+   id). Never include them in routine before/after-change suite runs.
+3. **Prefer not writing LLM tests at all.** New functionality is verified
+   with fake graphs and stub agents (see `tests/conftest.py`); real-model
+   behavior is covered by the user's manual test at each step gate.
+4. **Baseline bookkeeping**: compare suite results against the non-LLM
+   baseline recorded in `docs/build_log.md` (2026-08-17: 680 passed /
+   5 failed / 22 deselected). Runs that include `-m llm` are not baselines.
+
 ### Role
 You are a senior reseasrcher in machine learning and artificial intelligence. You are given a task and you are to complete it.
 

@@ -1,3 +1,6 @@
+// Origin of the FastAPI backend the /api/* rewrites proxy to.
+const backendOrigin = process.env.BACKEND_ORIGIN?.trim() || "http://localhost:8000";
+
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   // Pre-existing noImplicitAny errors across 24 files — skip until bulk-fixed
@@ -10,7 +13,7 @@ const nextConfig = {
     return [
       {
         source: "/api/:path*",
-        destination: "http://localhost:8000/api/:path*",
+        destination: `${backendOrigin}/api/:path*`,
       },
     ];
   },
@@ -24,6 +27,9 @@ const nextConfig = {
     "@deck.gl/layers",
     "@deck.gl/react",
     "react-map-gl",
+    "@neo4j-nvl/base",
+    "@neo4j-nvl/react",
+    "@neo4j-nvl/interaction-handlers",
   ],
 
   // ── Experimental optimizations ────────────────────────────────────
@@ -84,6 +90,15 @@ const nextConfig = {
           codemirror: {
             test: /[\\/]node_modules[\\/](@codemirror|@lezer|codemirror)[\\/]/,
             name: "codemirror",
+            chunks: "all",
+            priority: 25,
+            reuseExistingChunk: true,
+          },
+
+          // Neo4j Visualization Library
+          nvl: {
+            test: /[\\/]node_modules[\\/]@neo4j-nvl[\\/]/,
+            name: "nvl",
             chunks: "all",
             priority: 25,
             reuseExistingChunk: true,

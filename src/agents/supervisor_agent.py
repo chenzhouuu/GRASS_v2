@@ -10,11 +10,17 @@ Uses tool-calling to route tasks to workers:
   response directly.
 """
 
+import json
 import logging
 import uuid
 from typing import Any, Literal
 
-from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from pydantic import BaseModel, Field
 
 from ..utils.message_history import trim_history
@@ -71,6 +77,29 @@ def _infer_presentation_hint(cypher_results: list[dict], state: dict) -> str | N
         )
 
     return None
+
+
+def _summarize_solution_for_context(solution: Any, max_chars: int = 600) -> str:
+    """Headline view of an optimization solution for the routing context.
+
+    The Supervisor decides what to do next from status/objective/scale;
+    the full dict (routes, sensitivity, duals) lives in state for the
+    workers that actually consume it.
+    """
+    if not isinstance(solution, dict):
+        return str(solution)[:max_chars]
+    parts = []
+    for key in ("status", "objective", "solver"):
+        if key in solution:
+            parts.append(f"{key}={solution[key]}")
+    routes = solution.get("routes") or []
+    if isinstance(routes, list) and routes:
+        parts.append(f"{len(routes)} active route(s)")
+    binding = solution.get("binding") or []
+    if isinstance(binding, list) and binding:
+        parts.append(f"binding: {', '.join(str(b) for b in binding[:5])}")
+    text = "; ".join(parts) if parts else str(solution)
+    return text[:max_chars]
 
 
 # ── tool schemas for LLM binding ──────────────────────────────────
@@ -330,6 +359,10 @@ class SupervisorAgent:
         - ``None`` → END (Supervisor produced final response)
         - ``"Cypher"`` / ``"Analytics"`` / etc. → route to that worker
         """
+        auto_dispatch = self._plan_driven_dispatch(state)
+        if auto_dispatch is not None:
+            return auto_dispatch
+
         messages = self._build_messages(state)
         # Per-invocation context — replaces mutable instance attributes so
         # concurrent requests sharing this agent instance cannot race.
@@ -506,6 +539,160 @@ class SupervisorAgent:
                     seq.append(self._handoff_map[name])
         return seq
 
+    @staticmethod
+    def _current_turn_messages(messages: list) -> list:
+        """Messages after the last HumanMessage (the current user turn).
+
+        Plans are per-turn state while the message history is
+        session-durable; aligning a plan against the whole history counts
+        previous turns' dispatches as progress on the current plan, which
+        skips real steps (or marks the plan complete prematurely).
+        """
+        for i in range(len(messages) - 1, -1, -1):
+            if isinstance(messages[i], HumanMessage):
+                return messages[i + 1:]
+        return messages
+
+    @staticmethod
+    def _plan_progress(
+        plan_steps: list, executed: list[str]
+    ) -> tuple[list[bool], int | None]:
+        """Align the plan's agent sequence against executed dispatches.
+
+        Subsequence alignment: robust to off-plan corrective dispatches and
+        retries (see the plan-progress comment in ``_build_messages``).
+        Returns per-step done flags and the index of the first incomplete
+        step (``None`` when the plan is complete).
+        """
+        done_flags: list[bool] = []
+        cursor = 0
+        for step in plan_steps:
+            step_agent = (step.get("agent") or "").strip().lower()
+            matched = False
+            while cursor < len(executed):
+                if executed[cursor].lower() == step_agent:
+                    matched = True
+                    cursor += 1
+                    break
+                cursor += 1  # off-plan dispatch — skip it
+            done_flags.append(matched)
+        next_idx = next((i for i, done in enumerate(done_flags) if not done), None)
+        return done_flags, next_idx
+
+    # Plan-step agents whose dispatch is purely mechanical (a task-carrying
+    # handoff tool exists). Scenario/sweep steps need define_scenario /
+    # define_sweep arguments only the LLM can construct.
+    _AUTO_DISPATCH_TOOLS = {
+        "cypher": "dispatch_cypher",
+        "analytics": "dispatch_analytics",
+        "optimization": "dispatch_optimization",
+        "report": "finish_with_report",
+    }
+
+    def _plan_driven_dispatch(self, state: dict) -> dict[str, Any] | None:
+        """Dispatch the next plan step without an LLM call when unambiguous.
+
+        The routing round after a worker returns used to re-send the full
+        context so the model could emit exactly the tool call the NEXT
+        ACTION directive already named — pure translation. When the plan
+        and worker results leave no judgment to make, build the same
+        handoff (synthesized tool-call message pair included, so plan
+        progress tracking and the frontend see an identical history)
+        deterministically. Any sign that judgment IS needed — a worker
+        error, worker feedback, an empty retrieval, a step type without a
+        direct dispatch tool, or plan completion — returns ``None`` and
+        the LLM loop proceeds unchanged.
+        """
+        plan = state.get("plan") or state.get("supervisor_plan")
+        if not plan or not plan.get("steps"):
+            return None
+        if (
+            state.get("cypher_error")
+            or state.get("analysis_error")
+            or state.get("optimization_error")
+            or state.get("worker_feedback")
+        ):
+            return None
+
+        executed = self._executed_worker_sequence(
+            self._current_turn_messages(list(state.get("messages", [])))
+        )
+        if not executed:
+            # First routing round stays with the LLM (it may fetch the
+            # schema or refine the first task before dispatching).
+            return None
+        if executed[-1] == "Cypher" and not state.get("cypher_results"):
+            return None  # empty retrieval needs judgment (schema check, rewrite)
+
+        plan_steps = plan["steps"]
+        _, next_idx = self._plan_progress(plan_steps, executed)
+        if next_idx is None:
+            return None  # plan complete — the LLM writes the final response
+
+        step = plan_steps[next_idx]
+        agent_key = (step.get("agent") or "").strip().lower()
+        tool_name = self._AUTO_DISPATCH_TOOLS.get(agent_key)
+        if tool_name is None:
+            return None
+        worker = self._handoff_map[tool_name]
+        task = (
+            step.get("task")
+            or step.get("details")
+            or step.get("title")
+            or step.get("description", "")
+        )
+
+        tool_calls: list[dict] = []
+        tool_results: list[str] = []
+        state_update: dict[str, Any] = {}
+
+        # The geo extraction an LLM round would have done on the way to a
+        # non-Cypher step is itself deterministic — run it here.
+        if (
+            state.get("requires_geo")
+            and state.get("cypher_results")
+            and not state.get("geo_data")
+            and agent_key != "cypher"
+        ):
+            geo_data = _extract_geo_data_fn(state["cypher_results"])
+            feature_count = len(geo_data.get("features", []))
+            if feature_count:
+                tool_calls.append({
+                    "name": "extract_geo_data",
+                    "args": {},
+                    "id": f"auto-geo-{uuid.uuid4().hex[:8]}",
+                    "type": "tool_call",
+                })
+                tool_results.append(
+                    f"Extracted {feature_count} geographic features as GeoJSON."
+                )
+                state_update["geo_data"] = geo_data
+
+        dispatch_args = {"task": task} if tool_name != "finish_with_report" else {}
+        tool_calls.append({
+            "name": tool_name,
+            "args": dispatch_args,
+            "id": f"auto-dispatch-{uuid.uuid4().hex[:8]}",
+            "type": "tool_call",
+        })
+        tool_results.append(f"Dispatching to {worker}...")
+
+        emitted: list = [AIMessage(content="", tool_calls=tool_calls)]
+        for tc, result in zip(tool_calls, tool_results):
+            emitted.append(ToolMessage(content=result, tool_call_id=tc["id"]))
+
+        logger.info(
+            "Supervisor: plan-driven dispatch (no LLM) — step %d/%d → %s",
+            next_idx + 1, len(plan_steps), worker,
+        )
+        state_update.update({
+            "next_worker": worker,
+            "worker_task": task if tool_name != "finish_with_report" else "",
+            "messages": emitted,
+            "sender": self.agent_name,
+        })
+        return state_update
+
     def _build_messages(self, state: dict) -> list:
         """Build the message list for the Supervisor LLM call."""
         system_prompt = self.prompt_assembler.assemble()
@@ -526,13 +713,20 @@ class SupervisorAgent:
         # window start on an orphaned ToolMessage).
         history = trim_history(history, MAX_HISTORY_MESSAGES)
 
-        # Inject worker results summary if returning from a worker
+        # Inject worker results summary if returning from a worker.
+        # The Supervisor routes on data SHAPE (row count, columns), never on
+        # raw values — full rows here previously grew this block past 8k chars
+        # of context re-sent on every routing turn.
         context_parts = []
         if state.get("cypher_results"):
             results = state["cypher_results"]
-            preview = str(results[:5]) if len(results) > 5 else str(results)
+            columns = ", ".join(results[0].keys())
+            sample = json.dumps(results[:2], default=str)
+            if len(sample) > 600:
+                sample = sample[:600] + "…"
             context_parts.append(
-                f"[Cypher results: {len(results)} records] {preview}"
+                f"[Cypher results: {len(results)} records; "
+                f"columns: {columns}] sample: {sample}"
             )
             # Data shape analysis: nudge toward Analytics for multi-row
             # categorical+numeric data (deterministic, not keyword-based)
@@ -566,7 +760,8 @@ class SupervisorAgent:
                 context_parts.append(f"[Optimization model: {opt_model[:200]}]")
         if state.get("optimization_solution"):
             context_parts.append(
-                f"[Optimization solution: {state['optimization_solution']}]"
+                f"[Optimization solution: "
+                f"{_summarize_solution_for_context(state['optimization_solution'])}]"
             )
         if state.get("optimization_error"):
             context_parts.append(
@@ -593,20 +788,10 @@ class SupervisorAgent:
         plan = state.get("plan") or state.get("supervisor_plan")
         if plan and plan.get("steps"):
             plan_steps = plan["steps"]
-            executed = self._executed_worker_sequence(state.get("messages", []))
-
-            done_flags: list[bool] = []
-            cursor = 0
-            for step in plan_steps:
-                step_agent = (step.get("agent") or "").strip().lower()
-                matched = False
-                while cursor < len(executed):
-                    if executed[cursor].lower() == step_agent:
-                        matched = True
-                        cursor += 1
-                        break
-                    cursor += 1  # off-plan dispatch — skip it
-                done_flags.append(matched)
+            executed = self._executed_worker_sequence(
+                self._current_turn_messages(list(state.get("messages", [])))
+            )
+            done_flags, next_idx = self._plan_progress(plan_steps, executed)
 
             completed = sum(done_flags)
             total = len(plan_steps)
@@ -627,9 +812,6 @@ class SupervisorAgent:
                 )
 
             # Next action = first incomplete step (not simply the n-th).
-            next_idx = next(
-                (i for i, done in enumerate(done_flags) if not done), None
-            )
             if next_idx is not None:
                 next_step = plan_steps[next_idx]
                 next_agent = next_step.get("agent", "?")
@@ -674,11 +856,19 @@ class SupervisorAgent:
                     fb_lines.append(f"- [{agent}]: {msg}")
             context_parts.append("\n".join(fb_lines))
 
+        # The dynamic state block goes AFTER the history: it changes every
+        # turn, and placing it between the static system prompt and the
+        # history froze the provider's prefix cache at the system prompt
+        # (traced: cache_read stuck at ~5k while prompts grew to 11.5k).
+        # At the end, the stable [system + history] prefix caches, and the
+        # directive plan-progress block sits where the model attends most.
+        # It is a HumanMessage, not a SystemMessage: Anthropic rejects
+        # non-consecutive system messages, and providers are config-driven.
         if context_parts:
-            context_msg = SystemMessage(
+            context_msg = HumanMessage(
                 content="## Current State\n" + "\n".join(context_parts)
             )
-            return [system, context_msg] + history
+            return [system] + history + [context_msg]
         return [system] + history
 
     # ── local tool implementations ────────────────────────────────
@@ -718,8 +908,6 @@ class SupervisorAgent:
 
     def _build_plan_prompt(self, query: str) -> list:
         """Build the message list for the planning sub-call."""
-        from langchain_core.messages import HumanMessage
-
         schema_text = load_schema_text(source="auto")
         plan_system = (
             "You are a planning assistant for a supply chain analytics system. "

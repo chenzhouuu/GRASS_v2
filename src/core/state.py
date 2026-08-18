@@ -79,8 +79,10 @@ class GRASSState(TypedDict):
     cypher_metadata: Optional[dict]
 
     # -- Accumulated query results (append-only across multiple Cypher calls)
-    # Used by Optimization Agent to access data from ALL Cypher steps,
-    # not just the last one (which overwrites cypher_results).
+    # Legacy data source for the Optimization Agent when no session
+    # workspace exists (benchmarks, tests). Workspace sessions keep rows in
+    # named tables on disk instead (src/tools/session_workspace.py) and
+    # leave this empty, so checkpoints stay bounded (P2-c).
     all_query_results: Annotated[List[dict], operator.add]
 
     # -- Analytics Agent output (analysis) --------------------------------

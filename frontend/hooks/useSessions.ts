@@ -9,6 +9,8 @@ import { useMapStore } from "@/stores/mapStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { getDemoData } from "@/lib/demoData";
 import { fetchSessionPreferences } from "@/lib/preferences";
+import { reconnectToActiveRun } from "@/lib/api";
+import { stopRunWatch } from "@/lib/runWatch";
 import { apiUrl } from "@/lib/backend";
 import { geoJsonToMapPayload } from "@/lib/mapData";
 import type { Message, Session } from "@/lib/types";
@@ -105,6 +107,9 @@ function getPersistedCurrentSessionId(): string | null {
 }
 
 function resetSessionStores() {
+  // Stop WATCHING any in-flight run — deliberately not stopping the run
+  // itself: the backend owns it and will finish and persist regardless.
+  stopRunWatch();
   useChatStore.getState().clearMessages();
   useChatStore.getState().setPendingPlan(null);
   useChatStore.getState().setStreaming(false, null);
@@ -198,6 +203,10 @@ export async function loadSessionIntoStores(sessionId: string): Promise<void> {
       );
     }
   }
+
+  // If this session has a run in flight (refresh, second tab, switching
+  // back), re-attach to it — the replayed backlog rebuilds the live view.
+  void reconnectToActiveRun(sessionId).catch(() => undefined);
 
   // Restore per-session UI preferences (query history, saved queries, tab, map state)
   try {
@@ -322,15 +331,15 @@ export function useSessions() {
     persistCurrentSessionId(currentSessionId);
   }, [currentSessionId]);
 
+  // Switching away during a run is allowed: it only stops WATCHING (the
+  // backend finishes the run), and selecting the session again re-attaches.
   const handleNew = useCallback(async () => {
-    if (useChatStore.getState().isStreaming) return;
     const session = await createSession();
     resetSessionStores();
     persistCurrentSessionId(session.id);
   }, []);
 
   const handleSelect = useCallback(async (id: string) => {
-    if (useChatStore.getState().isStreaming) return;
     await loadSessionIntoStores(id);
   }, []);
 

@@ -67,19 +67,15 @@ class CypherAgent:
         messages = self._prepare_messages(state)
         loop_result = self._run_react_loop(messages)
 
+        # The loop normally ends right after a successful execution (last
+        # message is a ToolMessage). The facts the Supervisor needs are all
+        # in loop_result — composing them deterministically replaces a
+        # full-context LLM call per dispatch (traced: 16.8k prompt tokens
+        # for a summary of row count + columns).
         if self._needs_final_summary(messages):
-            messages.append(
-                HumanMessage(
-                    content=(
-                        "Summarize the results you retrieved for the current task. "
-                        "Include the Cypher query, row count, assumptions, and any "
-                        "data limitations."
-                    )
-                )
-            )
-            messages.append(self.model.invoke(messages))
-
-        final_content = messages[-1].content if hasattr(messages[-1], "content") else ""
+            final_content = self._deterministic_summary(loop_result)
+        else:
+            final_content = messages[-1].content if hasattr(messages[-1], "content") else ""
         task_desc = self._get_task_desc(state)
         records = loop_result["records"]
 
@@ -101,18 +97,23 @@ class CypherAgent:
                 "validation": loop_result["metadata"].get("validation"),
             },
             "sender": self.agent_name,
-            "all_query_results": [
-                {**record, "_query_step": task_desc[:80]} for record in records
-            ],
         }
 
         # Register the result set as a named workspace table so later
         # Analytics steps can reach data from EVERY retrieval step, not
-        # just the last one (P2-a).
+        # just the last one (P2-a). Without a workspace (no session id:
+        # benchmarks, tests) fall back to accumulating the tagged rows in
+        # state — the optimizer's legacy data source. Workspace sessions
+        # deliberately skip that accumulation: rows would otherwise be
+        # rewritten into every checkpoint for the session's lifetime (P2-c).
         workspace = get_workspace(state.get("session_id"))
         if workspace and records:
             table = workspace.register_table(records, description=task_desc[:80])
             result["cypher_metadata"]["workspace_table"] = table["name"]
+        else:
+            result["all_query_results"] = [
+                {**record, "_query_step": task_desc[:80]} for record in records
+            ]
 
         result_summary = self._summarize_step_result(
             loop_result["query"],
@@ -264,15 +265,21 @@ class CypherAgent:
             logger.error("Tool %s failed: %s", tool_name, exc)
             return {"error": str(exc)}
 
-    @staticmethod
-    def _format_tool_observation(tool_name: str | None, tool_result: Any) -> str:
+    # 5 rows show the model the result shape and value ranges; row_count and
+    # columns are in the metadata. 20 rows of wide records previously put
+    # ~20k chars into every post-execution turn.
+    MAX_OBSERVATION_RECORDS = 5
+
+    @classmethod
+    def _format_tool_observation(cls, tool_name: str | None, tool_result: Any) -> str:
         """Compact large tool outputs before feeding observations back to the LLM."""
         if isinstance(tool_result, dict):
             compact = dict(tool_result)
             records = compact.get("records")
-            if isinstance(records, list) and len(records) > 20:
-                compact["records"] = records[:20]
-                compact["records_omitted"] = len(records) - 20
+            cap = cls.MAX_OBSERVATION_RECORDS
+            if isinstance(records, list) and len(records) > cap:
+                compact["records"] = records[:cap]
+                compact["records_omitted"] = len(records) - cap
             return json.dumps(compact, default=str)
         return str(tool_result)
 
@@ -389,6 +396,36 @@ class CypherAgent:
     def _needs_final_summary(messages: list) -> bool:
         last_message = messages[-1]
         return last_message.type != "ai" or bool(getattr(last_message, "tool_calls", None))
+
+    @staticmethod
+    def _deterministic_summary(loop_result: dict[str, Any]) -> str:
+        """Compose the worker's final message from the loop facts."""
+        query = loop_result["query"]
+        records = loop_result["records"]
+        error = loop_result["error"]
+        metadata = loop_result["metadata"]
+
+        if error:
+            return (
+                f"Cypher retrieval failed after "
+                f"{loop_result['execution_attempts']} attempt(s): {error}"
+            )
+        if not records:
+            return (
+                "Query executed successfully but returned no rows."
+                + (f"\nQuery: {query}" if query else "")
+            )
+
+        columns = metadata.get("columns") or list(records[0].keys())
+        parts = [
+            f"Retrieved {len(records)} rows.",
+            f"Columns: {', '.join(columns)}.",
+        ]
+        if metadata.get("truncated"):
+            parts.append("Results were truncated at the row cap.")
+        if query:
+            parts.append(f"Query: {query}")
+        return "\n".join(parts)
 
     def _get_task_desc(self, state: dict[str, Any]) -> str:
         return state.get("worker_task", "Cypher query")

@@ -48,16 +48,41 @@ class SessionWorkspace:
         return os.path.join(self._dir_abs, "manifest.json")
 
     def catalog(self) -> list[dict]:
-        """All registered tables, oldest first."""
+        """All registered tables, oldest first.
+
+        The manifest lives inside the session directory, which is mounted
+        read-write into the execution sandbox — sandboxed code can rewrite
+        it, so its contents are untrusted. Entries whose path resolves
+        outside this session's tables directory are dropped here, the
+        single point where manifest data enters host-side code: otherwise
+        ``gather_tagged_rows`` would open attacker-chosen files on the
+        host and feed them into prompts.
+        """
         try:
             with open(self._manifest_abs, encoding="utf-8") as f:
-                return json.load(f)
+                entries = json.load(f)
         except FileNotFoundError:
             return []
         except ValueError:
             logger.warning("Corrupt workspace manifest at %s; starting fresh",
                            self._manifest_abs)
             return []
+
+        safe_root = os.path.realpath(self._dir_abs) + os.sep
+        kept: list[dict] = []
+        for e in entries if isinstance(entries, list) else []:
+            if not isinstance(e, dict):
+                continue
+            abs_path = os.path.realpath(
+                os.path.join(PROJECT_ROOT, str(e.get("path", "")))
+            )
+            if abs_path.startswith(safe_root):
+                kept.append(e)
+            else:
+                logger.warning(
+                    "Rejecting out-of-workspace table path %r", e.get("path")
+                )
+        return kept
 
     def register_table(
         self, rows: list[dict], description: str, source: str = "cypher"
@@ -93,6 +118,22 @@ def get_workspace(session_id: Optional[str]) -> Optional[SessionWorkspace]:
     """Workspace for the session, or None when no session id is available
     (benchmarks and tests, which keep the legacy single-file data flow)."""
     return SessionWorkspace(session_id) if session_id else None
+
+
+def gather_tagged_rows(entries: list[dict]) -> list[dict]:
+    """Flatten every table into one row list, each row tagged with its
+    originating step (``_query_step`` = table description) — the shape the
+    Optimization Agent previously received from ``all_query_results``."""
+    rows: list[dict] = []
+    for entry in entries:
+        try:
+            with open(os.path.join(PROJECT_ROOT, entry["path"]), encoding="utf-8") as f:
+                table_rows = json.load(f)
+        except (FileNotFoundError, ValueError):
+            logger.warning("Workspace table %s unreadable; skipping", entry.get("path"))
+            continue
+        rows.extend({**row, "_query_step": entry["description"]} for row in table_rows)
+    return rows
 
 
 def format_catalog_for_prompt(entries: list[dict]) -> str:

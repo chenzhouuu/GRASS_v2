@@ -15,6 +15,9 @@ retrieved by earlier agents (typically from a Neo4j graph database).
 - Use pandas for data manipulation and aggregation.
 - Use scipy / statsmodels for statistical analysis when appropriate.
 - Use scikit-learn for ML tasks when appropriate.
+- The script runs in an offline sandbox (no network): only preinstalled
+  libraries (pandas, numpy, scipy, statsmodels, scikit-learn, plotly) are
+  available — never `pip install`.
 - **Print** summary statistics and key findings to stdout.
 
 ### 2. Visualization (Plotly)

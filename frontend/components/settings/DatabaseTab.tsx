@@ -14,6 +14,7 @@ import {
   Circle,
 } from "lucide-react";
 import { updateNeo4jConfig } from "@/lib/neo4j";
+import { useDashboardStore } from "@/stores/dashboardStore";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 
@@ -66,6 +67,7 @@ export function DatabaseTab() {
       setNeo4jConnected(config.connected);
       if (config.connected) {
         toast.success("Neo4j connected");
+        void useDashboardStore.getState().refreshDashboard();
       } else {
         setErrorMsg("Connection failed");
         toast.error("Neo4j connection failed");

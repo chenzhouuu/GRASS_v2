@@ -13,9 +13,6 @@ user-facing answer.
 
 ## Safety and conduct
 
-This is a research and analytics assistant, not a commercial product — keep these guardrails
-simple but follow them consistently:
-
 - Ground every quantitative claim in actual tool output. Never invent entities, numbers, or
   relationships that are not present in the query or analysis results.
 - If data is missing, partial, or implausible, say so plainly instead of guessing or

@@ -26,16 +26,52 @@ from typing import Any
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from ..core.schemas import KPI, OptimizationFormulation, OptimizationRun
-from ..tools.python_executor import execute_python, persist_cypher_results
+from ..tools.python_executor import (
+    execute_python,
+    execution_session,
+    persist_optimization_input,
+)
+from ..tools.session_workspace import gather_tagged_rows, get_workspace
 from ..utils.data_summarizer import summarize_data, format_summary_for_prompt, make_data_preview
 from ..utils.prompt_loader import load_prompt
-from ..utils.plotly_markers import extract_plotly_specs, strip_plotly_markers
+from ..utils.plotly_markers import (
+    PLOTLY_PATTERN,
+    extract_plotly_specs,
+    strip_plotly_markers,
+)
 
 logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 2
 MAX_FORMULATION_RETRIES = 2
 _MODIFY_PREFIX = "MODIFY_PREVIOUS:"
+
+_SOLUTION_JSON_LINE = re.compile(r"SOLUTION_JSON:[^\n]*")
+_MAX_OBSERVATION_CHARS = 4_000
+
+
+def _compact_execution_observation(tool_result: Any) -> str:
+    """Compact execute_python output before it enters the LLM context.
+
+    The full stdout stays in ``last_output`` for programmatic parsing
+    (SOLUTION_JSON extraction, degeneracy checks, chart specs); the model
+    only needs the human-readable solver lines, not the machine-readable
+    blobs, which dominated a traced 27.6k-token prompt for a 94-token
+    summary reply.
+    """
+    if not isinstance(tool_result, dict):
+        return str(tool_result)
+    compact = dict(tool_result)
+    output = compact.get("output") or ""
+    if output:
+        output = PLOTLY_PATTERN.sub("[chart spec captured]", output)
+        output = _SOLUTION_JSON_LINE.sub(
+            "[SOLUTION_JSON captured — parsed programmatically]", output
+        )
+        if len(output) > _MAX_OBSERVATION_CHARS:
+            output = output[:_MAX_OBSERVATION_CHARS] + "\n... [output truncated]"
+        compact["output"] = output
+    return str(compact)
 
 class _PipelineExhaustedError(Exception):
     """Raised when the 4-stage pipeline exhausts all retries."""
@@ -332,6 +368,34 @@ _INFEASIBLE_CORRECTION = (
 )
 
 
+def _deterministic_opt_summary(last_output: str | None, last_error: str | None) -> str:
+    """Compose the worker's final message from the parsed solution.
+
+    Replaces the trailing 'Summarize the optimization results.' LLM call,
+    which re-read the whole codegen conversation (traced: 27.6k prompt
+    tokens for a 94-token reply).
+    """
+    if last_error:
+        return f"Optimization code execution failed: {last_error[:500]}"
+    solution = _extract_solution_json(last_output or "")
+    if not solution:
+        return (
+            "Optimization run completed but no SOLUTION_JSON was found "
+            "in the output."
+        )
+    parts = [f"Optimization complete: status {solution.get('status', 'unknown')}"]
+    objective = solution.get("objective")
+    if isinstance(objective, (int, float)):
+        parts.append(f"objective {objective:,.2f}")
+    routes = solution.get("routes") or []
+    if isinstance(routes, list) and routes:
+        parts.append(f"{len(routes)} active route(s)")
+    binding = solution.get("binding") or []
+    if isinstance(binding, list) and binding:
+        parts.append(f"binding: {', '.join(str(b) for b in binding[:5])}")
+    return "; ".join(parts) + "."
+
+
 def _is_infeasible_output(output: str | None) -> bool:
     """True when the parsed solution reports an infeasible/unbounded status."""
     sol = _extract_solution_json(output or "")
@@ -602,6 +666,7 @@ def build_optimization_run(
     scenario_id: str | None = None,
     run_id: str | None = None,
     input_data: list[dict] | None = None,
+    input_path: str = "",
 ) -> OptimizationRun:
     """Assemble an OptimizationRun snapshot from a formulation + solution (deterministic).
 
@@ -622,7 +687,22 @@ def build_optimization_run(
         binding_constraints=_extract_binding(sol),
         routes=sol.get("routes") or [],
         input_data=input_data or [],
+        input_path=input_path,
     )
+
+
+def _collect_input_rows(state: dict[str, Any]) -> list[dict]:
+    """All retrieval steps' rows, flat and step-tagged.
+
+    Workspace mode reads the session's named tables (P2-c); without a
+    workspace (benchmarks, tests) fall back to the state-accumulated rows.
+    """
+    workspace = get_workspace(state.get("session_id"))
+    if workspace:
+        rows = gather_tagged_rows(workspace.catalog())
+        if rows:
+            return rows
+    return state.get("all_query_results") or state.get("cypher_results") or []
 
 
 # ── Agent class ──────────────────────────────────────────────────────
@@ -658,9 +738,8 @@ class OptimizationAgent:
     # ── 4-Stage Pipeline ─────────────────────────────────────────────
 
     def _run_pipeline(self, state: dict[str, Any]) -> dict[str, Any]:
-        # Prefer accumulated results (from all Cypher steps) over latest-only
-        cypher_results = state.get("all_query_results") or state.get("cypher_results") or []
-        data_path = persist_cypher_results(cypher_results, state.get("session_id"))
+        cypher_results = _collect_input_rows(state)
+        data_path = persist_optimization_input(cypher_results, state.get("session_id"))
         task = state.get("worker_task") or "Formulate and solve an optimization problem."
         user_query = state.get("user_query", "")
 
@@ -679,10 +758,16 @@ class OptimizationAgent:
             formulation = self._run_stage1(task, user_query, data_context, data_summary)
 
         # ── Stage 3: Generate Code ───────────────────────────────
-        code_result = self._run_stage3(formulation, data_preview, user_query, data_path)
+        code_result = self._run_stage3(
+            formulation, data_preview, user_query, data_path,
+            session_id=state.get("session_id"),
+        )
 
         # ── Stage 4: Post-process ────────────────────────────────
-        return self._build_result(formulation, code_result, state)
+        return self._build_result(
+            formulation, code_result, state,
+            input_rows=cypher_results, input_path=data_path,
+        )
 
     def _run_stage1(
         self, task: str, user_query: str, data_context: str, data_summary: dict,
@@ -845,11 +930,13 @@ class OptimizationAgent:
         deterministically-perturbed) data. Returns the modified formulation, the
         regenerated code, and the parsed solution.
         """
-        data_path = persist_cypher_results(perturbed_rows, session_id)
+        data_path = persist_optimization_input(perturbed_rows, session_id)
         base = OptimizationFormulation.model_validate(base_formulation)
         formulation = self._modify_formulation(base, instruction)
         data_preview = make_data_preview(perturbed_rows, max_rows=3)
-        code_result = self._run_stage3(formulation, data_preview, user_query, data_path)
+        code_result = self._run_stage3(
+            formulation, data_preview, user_query, data_path, session_id=session_id
+        )
         output = code_result.get("last_output") or ""
         error = code_result.get("last_error")
         solution = _extract_solution_json(output) if not error else None
@@ -866,6 +953,7 @@ class OptimizationAgent:
         data_preview: str,
         user_query: str,
         data_path: str = "data/cypher_results.json",
+        session_id: str | None = None,
     ) -> dict[str, Any]:
         """Stage 3+4: Generate code, execute, and collect results."""
         template = load_prompt("optimization_codegen.txt")
@@ -902,8 +990,15 @@ class OptimizationAgent:
 
             for tc in ai_msg.tool_calls:
                 tool_fn = tool_map.get(tc["name"])
-                tool_result = tool_fn.invoke(tc["args"]) if tool_fn else f"Unknown tool: {tc['name']}"
-                messages.append(ToolMessage(content=str(tool_result), tool_call_id=tc["id"]))
+                if tool_fn:
+                    with execution_session(session_id):
+                        tool_result = tool_fn.invoke(tc["args"])
+                else:
+                    tool_result = f"Unknown tool: {tc['name']}"
+                messages.append(ToolMessage(
+                    content=_compact_execution_observation(tool_result),
+                    tool_call_id=tc["id"],
+                ))
 
                 if tc["name"] == "execute_python":
                     last_code = tc["args"].get("code", "")
@@ -938,13 +1033,10 @@ class OptimizationAgent:
                     content=_DEGENERATE_CORRECTION if degenerate else _INFEASIBLE_CORRECTION
                 ))
 
-        # Force summary if needed
         if messages[-1].type != "ai" or messages[-1].tool_calls:
-            messages.append(HumanMessage(content="Summarize the optimization results."))
-            final_msg = self.model.invoke(messages)
-            messages.append(final_msg)
-
-        final_content = messages[-1].content if hasattr(messages[-1], "content") else ""
+            final_content = _deterministic_opt_summary(last_output, last_error)
+        else:
+            final_content = messages[-1].content if hasattr(messages[-1], "content") else ""
         final_content = strip_plotly_markers(final_content)
 
         return {
@@ -959,8 +1051,15 @@ class OptimizationAgent:
         formulation: OptimizationFormulation,
         code_result: dict[str, Any],
         state: dict[str, Any],
+        input_rows: list[dict] | None = None,
+        input_path: str = "",
     ) -> dict[str, Any]:
-        """Assemble final state update from pipeline results."""
+        """Assemble final state update from pipeline results.
+
+        ``input_rows`` are the rows the generated code actually read; they
+        go into the baseline snapshot so scenario re-runs perturb exactly
+        the solved data.
+        """
         output = code_result["last_output"] or ""
         error = code_result["last_error"]
 
@@ -1003,10 +1102,13 @@ class OptimizationAgent:
         # input data + KPIs/duals/binding) so a later what-if scenario can
         # perturb its data and re-run the cached code without re-formulating.
         if solution and not error:
-            baseline_data = state.get("all_query_results") or state.get("cypher_results") or []
+            baseline_data = (
+                input_rows if input_rows is not None else _collect_input_rows(state)
+            )
             baseline_run = build_optimization_run(
                 formulation, code_result.get("last_code") or "", solution,
                 input_data=baseline_data,
+                input_path=input_path,
             )
             result["optimization_baseline"] = baseline_run.model_dump()
 
@@ -1142,8 +1244,8 @@ class OptimizationAgent:
 
     def _run_single_shot(self, state: dict[str, Any]) -> dict[str, Any]:
         """Fallback: direct code generation without structured formulation."""
-        cypher_results = state.get("all_query_results") or state.get("cypher_results") or []
-        data_path = persist_cypher_results(cypher_results, state.get("session_id"))
+        cypher_results = _collect_input_rows(state)
+        data_path = persist_optimization_input(cypher_results, state.get("session_id"))
         task = state.get("worker_task") or "Formulate and solve an optimization problem."
         user_query = state.get("user_query", "")
 
@@ -1178,8 +1280,15 @@ class OptimizationAgent:
                 break
             for tc in ai_msg.tool_calls:
                 tool_fn = tool_map.get(tc["name"])
-                tool_result = tool_fn.invoke(tc["args"]) if tool_fn else f"Unknown: {tc['name']}"
-                messages.append(ToolMessage(content=str(tool_result), tool_call_id=tc["id"]))
+                if tool_fn:
+                    with execution_session(state.get("session_id")):
+                        tool_result = tool_fn.invoke(tc["args"])
+                else:
+                    tool_result = f"Unknown: {tc['name']}"
+                messages.append(ToolMessage(
+                    content=_compact_execution_observation(tool_result),
+                    tool_call_id=tc["id"],
+                ))
                 if tc["name"] == "execute_python" and isinstance(tool_result, dict):
                     last_output = tool_result.get("output")
                     last_error = tool_result.get("error")
@@ -1198,10 +1307,9 @@ class OptimizationAgent:
                 ))
 
         if messages[-1].type != "ai" or messages[-1].tool_calls:
-            messages.append(HumanMessage(content="Summarize the results."))
-            messages.append(self.model.invoke(messages))
-
-        final = messages[-1].content if hasattr(messages[-1], "content") else ""
+            final = _deterministic_opt_summary(last_output, last_error)
+        else:
+            final = messages[-1].content if hasattr(messages[-1], "content") else ""
         final = strip_plotly_markers(final)
         solution = _extract_solution_json(last_output or "") if not last_error else None
 

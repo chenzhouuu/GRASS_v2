@@ -23,7 +23,11 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-from ..tools.python_executor import execute_python, persist_cypher_results
+from ..tools.python_executor import (
+    execute_python,
+    execution_session,
+    persist_cypher_results,
+)
 from ..tools.session_workspace import format_catalog_for_prompt, get_workspace
 from ..utils.data_summarizer import summarize_data, format_summary_for_prompt, make_data_preview
 from ..utils.prompt_loader import load_prompt
@@ -327,7 +331,8 @@ class AnalyticsAgent:
                 if tool_fn is None:
                     tool_result = f"Unknown tool: {tool_name}"
                 else:
-                    tool_result = tool_fn.invoke(tool_args)
+                    with execution_session(state.get("session_id")):
+                        tool_result = tool_fn.invoke(tool_args)
 
                 messages.append(
                     ToolMessage(
@@ -351,7 +356,8 @@ class AnalyticsAgent:
                     fixed_code = _auto_fix_syntax(last_code, last_error)
                     if fixed_code and fixed_code != last_code:
                         logger.info("Auto-fixed syntax error, re-executing without LLM retry")
-                        rerun = execute_python.invoke({"code": fixed_code})
+                        with execution_session(state.get("session_id")):
+                            rerun = execute_python.invoke({"code": fixed_code})
                         if isinstance(rerun, dict) and not rerun.get("error"):
                             last_code = fixed_code
                             last_output = rerun.get("output")

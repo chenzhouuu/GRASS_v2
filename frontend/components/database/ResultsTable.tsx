@@ -43,10 +43,39 @@ function findColumn(columns: string[], candidates: Set<string>): string | undefi
   return columns.find((c) => candidates.has(c.toLowerCase()));
 }
 
-function formatCellValue(value: unknown): string {
+export function formatCellValue(value: unknown): string {
   if (value === null || value === undefined) return "";
   if (typeof value === "boolean") return value ? "true" : "false";
   if (typeof value === "number") return value.toLocaleString();
+  if (typeof value === "object") {
+    const maybeGraphValue = value as {
+      _labels?: string[];
+      _type?: string;
+      _element_id?: string;
+      nodes?: unknown[];
+      relationships?: unknown[];
+      name?: unknown;
+      title?: unknown;
+    };
+    if (maybeGraphValue._labels?.length) {
+      const label = maybeGraphValue._labels.join(":");
+      const caption = maybeGraphValue.name ?? maybeGraphValue.title ?? maybeGraphValue._element_id;
+      return `(${label}${caption ? ` ${String(caption)}` : ""})`;
+    }
+    if (maybeGraphValue._type) {
+      return `[:${maybeGraphValue._type}]`;
+    }
+    if (Array.isArray(maybeGraphValue.nodes) || Array.isArray(maybeGraphValue.relationships)) {
+      const nodeCount = maybeGraphValue.nodes?.length ?? 0;
+      const relCount = maybeGraphValue.relationships?.length ?? 0;
+      return `Path (${nodeCount} nodes, ${relCount} rels)`;
+    }
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  }
   return String(value);
 }
 
@@ -80,7 +109,7 @@ const PAGE_SIZES = [25, 50, 100] as const;
 
 // ─── Component ──────────────────────────────────────────────────────────────
 
-export function ResultsTable() {
+export function ResultsTable({ showToolbar = true }: { showToolbar?: boolean }) {
   const results = useDatabaseStore((s) => s.results);
   const addMarkers = useMapStore((s) => s.addMarkers);
   const setActiveRightTab = useAppStore((s) => s.setActiveRightTab);
@@ -221,6 +250,7 @@ export function ResultsTable() {
   return (
     <div className="flex h-full flex-col">
       {/* Toolbar */}
+      {showToolbar && (
       <div className="flex flex-wrap items-center gap-1 border-b bg-muted/30 px-2 py-1.5">
         <Button
           size="sm"
@@ -286,6 +316,7 @@ export function ResultsTable() {
           Showing {from}-{to} of {totalRows} result{totalRows !== 1 ? "s" : ""}
         </span>
       </div>
+      )}
 
       {/* Table */}
       <div className="min-h-0 flex-1 overflow-auto" style={{ overflow: "auto", scrollbarGutter: "stable" }}>

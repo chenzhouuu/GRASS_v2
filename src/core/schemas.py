@@ -64,6 +64,44 @@ class PlanOutput(BaseModel):
 # ── Optimization formulation (OptiMUS-inspired) ─────────────────────
 
 
+class ReportSection(BaseModel):
+    """One narrative section of the PDF report."""
+
+    heading: str = Field(description="Section heading, e.g. 'Analysis & Findings'.")
+    body: str = Field(
+        default="",
+        description="Section prose. Plain-text paragraphs; no markdown or code.",
+    )
+    bullets: list[str] = Field(
+        default_factory=list,
+        description="Optional bullet points rendered after the body.",
+    )
+
+
+class ReportContent(BaseModel):
+    """Narrative content of the PDF report.
+
+    The Report Agent produces ONLY this content; page layout, tables of
+    optimization routes/KPIs, and the appendix are rendered by fixed code
+    (src/tools/report_renderer.py).
+    """
+
+    title: str = Field(description="Report title, concise and specific (<= 80 chars).")
+    executive_summary: str = Field(
+        description="One paragraph: key findings and top recommendation, with exact numbers."
+    )
+    sections: list[ReportSection] = Field(
+        description="2-4 narrative sections (data overview, findings, interpretation)."
+    )
+    recommendations: list[str] = Field(
+        description="3-5 specific, actionable next steps."
+    )
+    limitations: str = Field(
+        default="",
+        description="Short paragraph on data caveats and scope limits.",
+    )
+
+
 class OptSet(BaseModel):
     """A named set in the optimization model (e.g., set of farms)."""
     definition: str = Field(description="What this set represents.")
@@ -160,6 +198,15 @@ class OptimizationRun(BaseModel):
     input_data: list[dict] = Field(
         default_factory=list,
         description="Rows the model solved on (baseline only) — perturbed by scenarios.",
+    )
+    input_path: str = Field(
+        default="",
+        description=(
+            "Project-root-relative path the cached code reads its input from "
+            "(baked in at codegen). Scenario re-solves MUST write perturbed "
+            "rows to this exact path; empty means the baseline predates path "
+            "recording and cannot be safely re-solved."
+        ),
     )
 
 

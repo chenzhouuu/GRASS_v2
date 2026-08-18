@@ -1,7 +1,17 @@
 import { create } from "zustand";
-import type { CypherResult, Neo4jSchema, SavedQuery } from "@/lib/types";
+import type {
+  CypherResult,
+  DatabaseResultsViewMode,
+  Neo4jSchema,
+  SavedQuery,
+} from "@/lib/types";
 
 const MAX_HISTORY = 20;
+
+function hasGraphData(results: CypherResult | null) {
+  const graph = results?.graph;
+  return !!graph && (graph.nodes.length > 0 || graph.relationships.length > 0);
+}
 
 interface DatabaseState {
   // ── Query editor ────────────────────────────────────────────────────────
@@ -10,8 +20,11 @@ interface DatabaseState {
 
   // ── Results ─────────────────────────────────────────────────────────────
   results: CypherResult | null;
+  resultsViewMode: DatabaseResultsViewMode;
+  resultsViewModeTouched: boolean;
   isExecuting: boolean;
   setResults: (results: CypherResult | null) => void;
+  setResultsViewMode: (mode: DatabaseResultsViewMode) => void;
   setExecuting: (executing: boolean) => void;
 
   // ── History ─────────────────────────────────────────────────────────────
@@ -38,8 +51,30 @@ export const useDatabaseStore = create<DatabaseState>((set) => ({
 
   // Results
   results: null,
+  resultsViewMode: "table",
+  resultsViewModeTouched: false,
   isExecuting: false,
-  setResults: (results) => set({ results }),
+  setResults: (results) =>
+    set((state) => {
+      if (results === null) {
+        return {
+          results,
+          resultsViewMode: "table",
+          resultsViewModeTouched: false,
+        };
+      }
+      const autoMode = hasGraphData(results) ? "graph" : "table";
+      const requestedMode =
+        state.resultsViewMode === "graph" && !hasGraphData(results)
+          ? "table"
+          : state.resultsViewMode;
+      return {
+        results,
+        resultsViewMode: state.resultsViewModeTouched ? requestedMode : autoMode,
+      };
+    }),
+  setResultsViewMode: (mode) =>
+    set({ resultsViewMode: mode, resultsViewModeTouched: true }),
   setExecuting: (executing) => set({ isExecuting: executing }),
 
   // History (capped at MAX_HISTORY entries)

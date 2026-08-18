@@ -1,15 +1,22 @@
-"""Session management API endpoints and persistence helpers."""
+"""Session management API endpoints and persistence helpers (Postgres/ORM)."""
 
-import json
 import logging
 import uuid
 from datetime import datetime
 from typing import Any, List, Optional
 
-import aiosqlite
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
+from sqlalchemy import delete, func, select
 
+from ..db import (
+    ChatMessage,
+    ChatSession,
+    SessionModelConfig,
+    SessionPreferences,
+    create_tables,
+    db_session,
+)
 from ..utils.model_loader import (
     get_default_session_model_config,
     normalize_session_model_config,
@@ -19,8 +26,6 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 
-# Database path
-DB_PATH = "data/sessions.db"
 _session_runtime_api_keys: dict[str, dict[str, str]] = {}
 
 
@@ -108,55 +113,9 @@ class SessionPreferencesPayload(BaseModel):
 # ── Database initialization ─────────────────────────────────────────────────
 
 async def init_db():
-    """Initialize SQLite database with sessions table."""
+    """Initialize the Postgres session store (create missing tables)."""
     _session_runtime_api_keys.clear()
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS sessions (
-                id TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                run_id TEXT,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                timestamp INTEGER NOT NULL,
-                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
-            )
-        """)
-        cursor = await db.execute("PRAGMA table_info(messages)")
-        columns = {row[1] for row in await cursor.fetchall()}
-        if "run_id" not in columns:
-            await db.execute("ALTER TABLE messages ADD COLUMN run_id TEXT")
-        if "metadata" not in columns:
-            await db.execute("ALTER TABLE messages ADD COLUMN metadata TEXT")
-        await db.execute("""
-            CREATE INDEX IF NOT EXISTS idx_messages_session
-            ON messages(session_id)
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS session_model_configs (
-                session_id TEXT PRIMARY KEY,
-                config_json TEXT NOT NULL,
-                updated_at INTEGER NOT NULL,
-                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS session_preferences (
-                session_id TEXT PRIMARY KEY,
-                preferences_json TEXT NOT NULL DEFAULT '{}',
-                updated_at INTEGER NOT NULL,
-                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
-            )
-        """)
-        await db.commit()
+    await create_tables()
     logger.info("✓ Sessions database initialized")
 
 
@@ -171,39 +130,38 @@ def generate_title(first_message: str) -> str:
     return title or "New Session"
 
 
-def _session_summary_query() -> str:
-    return """
-        SELECT
-            s.id,
-            s.title,
-            s.created_at,
-            s.updated_at,
-            COUNT(m.id) as message_count,
-            (
-                SELECT substr(content, 1, 120)
-                FROM messages
-                WHERE session_id = s.id
-                ORDER BY id DESC
-                LIMIT 1
-            ) as last_message_preview
-        FROM sessions s
-        LEFT JOIN messages m ON s.id = m.session_id
-    """
+def _session_summary_stmt():
+    preview = (
+        select(func.substr(ChatMessage.content, 1, 120))
+        .where(ChatMessage.session_id == ChatSession.id)
+        .order_by(ChatMessage.id.desc())
+        .limit(1)
+        .correlate(ChatSession)
+        .scalar_subquery()
+    )
+    return (
+        select(
+            ChatSession.id,
+            ChatSession.title,
+            ChatSession.created_at,
+            ChatSession.updated_at,
+            func.count(ChatMessage.id).label("message_count"),
+            preview.label("last_message_preview"),
+        )
+        .outerjoin(ChatMessage, ChatMessage.session_id == ChatSession.id)
+        .group_by(ChatSession.id)
+    )
 
 
 async def get_session_summary(session_id: str) -> dict[str, Any] | None:
     """Return a session summary row or None if it does not exist."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            _session_summary_query() + """
-            WHERE s.id = ?
-            GROUP BY s.id
-            """,
-            (session_id,),
-        )
-        row = await cursor.fetchone()
-        return dict(row) if row else None
+    async with db_session() as db:
+        row = (
+            await db.execute(
+                _session_summary_stmt().where(ChatSession.id == session_id)
+            )
+        ).one_or_none()
+        return dict(row._mapping) if row else None
 
 
 async def ensure_session_exists(
@@ -221,13 +179,14 @@ async def ensure_session_exists(
     session_id = session_id or str(uuid.uuid4())
     session_title = title or "New Session"
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """
-            INSERT INTO sessions (id, title, created_at, updated_at)
-            VALUES (?, ?, ?, ?)
-            """,
-            (session_id, session_title, now, now),
+    async with db_session() as db:
+        db.add(
+            ChatSession(
+                id=session_id,
+                title=session_title,
+                created_at=now,
+                updated_at=now,
+            )
         )
         await db.commit()
 
@@ -249,45 +208,34 @@ async def append_message(
 ) -> dict[str, Any]:
     """Insert a message and refresh the session metadata."""
     message_ts = timestamp or int(datetime.now().timestamp() * 1000)
-    metadata_json = json.dumps(metadata, default=str) if metadata else None
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """
-            INSERT INTO messages (session_id, run_id, role, content, timestamp, metadata)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (session_id, run_id, role, content, message_ts, metadata_json),
+    async with db_session() as db:
+        db.add(
+            ChatMessage(
+                session_id=session_id,
+                run_id=run_id,
+                role=role,
+                content=content,
+                timestamp=message_ts,
+                meta=metadata,
+            )
         )
+        await db.flush()
 
-        if role == "user":
-            cursor = await db.execute(
-                """
-                SELECT COUNT(*) FROM messages
-                WHERE session_id = ? AND role = 'user'
-                """,
-                (session_id,),
-            )
-            user_message_count = (await cursor.fetchone())[0]
-            if user_message_count == 1:
-                await db.execute(
-                    """
-                    UPDATE sessions
-                    SET title = ?, updated_at = ?
-                    WHERE id = ? AND title = 'New Session'
-                    """,
-                    (generate_title(content), message_ts, session_id),
+        session = await db.get(ChatSession, session_id)
+        if session is not None:
+            if role == "user":
+                user_message_count = await db.scalar(
+                    select(func.count())
+                    .select_from(ChatMessage)
+                    .where(
+                        ChatMessage.session_id == session_id,
+                        ChatMessage.role == "user",
+                    )
                 )
-            else:
-                await db.execute(
-                    "UPDATE sessions SET updated_at = ? WHERE id = ?",
-                    (message_ts, session_id),
-                )
-        else:
-            await db.execute(
-                "UPDATE sessions SET updated_at = ? WHERE id = ?",
-                (message_ts, session_id),
-            )
+                if user_message_count == 1 and session.title == "New Session":
+                    session.title = generate_title(content)
+            session.updated_at = message_ts
 
         await db.commit()
 
@@ -303,21 +251,13 @@ async def get_session_model_config_payload(session_id: str) -> dict[str, Any]:
     if session_summary is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            """
-            SELECT config_json
-            FROM session_model_configs
-            WHERE session_id = ?
-            """,
-            (session_id,),
-        )
-        row = await cursor.fetchone()
+    async with db_session() as db:
+        stored = await db.get(SessionModelConfig, session_id)
 
     source = "defaults"
-    if row and row[0]:
+    if stored is not None and stored.config:
         try:
-            config = normalize_session_model_config(json.loads(row[0]))
+            config = normalize_session_model_config(stored.config)
             source = "session"
         except Exception as exc:
             logger.warning("Invalid persisted session model config for %s: %s", session_id, exc)
@@ -390,23 +330,19 @@ async def save_session_model_config(
         _session_runtime_api_keys.pop(session_id, None)
     now = int(datetime.now().timestamp() * 1000)
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with db_session() as db:
         if overrides["agent_models"] or overrides.get("api_keys"):
-            await db.execute(
-                """
-                INSERT INTO session_model_configs (session_id, config_json, updated_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(session_id) DO UPDATE SET
-                    config_json = excluded.config_json,
-                    updated_at = excluded.updated_at
-                """,
-                (session_id, json.dumps(overrides), now),
+            await db.merge(
+                SessionModelConfig(
+                    session_id=session_id, config=overrides, updated_at=now
+                )
             )
             source = "session"
         else:
             await db.execute(
-                "DELETE FROM session_model_configs WHERE session_id = ?",
-                (session_id,),
+                delete(SessionModelConfig).where(
+                    SessionModelConfig.session_id == session_id
+                )
             )
             source = "defaults"
         await db.commit()
@@ -421,20 +357,11 @@ async def save_session_model_config(
 
 async def get_session_preferences(session_id: str) -> dict[str, Any]:
     """Return only the stored preferences for a session."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "SELECT preferences_json FROM session_preferences WHERE session_id = ?",
-            (session_id,),
-        )
-        row = await cursor.fetchone()
+    async with db_session() as db:
+        stored = await db.get(SessionPreferences, session_id)
 
-    if row and row[0]:
-        try:
-            stored = json.loads(row[0])
-            if isinstance(stored, dict):
-                return stored
-        except (json.JSONDecodeError, TypeError):
-            pass
+    if stored is not None and isinstance(stored.preferences, dict):
+        return stored.preferences
     return {}
 
 
@@ -447,18 +374,12 @@ async def save_session_preferences_data(
         raise HTTPException(status_code=404, detail="Session not found")
 
     now = int(datetime.now().timestamp() * 1000)
-    prefs_json = json.dumps(preferences, default=str)
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """
-            INSERT INTO session_preferences (session_id, preferences_json, updated_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(session_id) DO UPDATE SET
-                preferences_json = excluded.preferences_json,
-                updated_at = excluded.updated_at
-            """,
-            (session_id, prefs_json, now),
+    async with db_session() as db:
+        await db.merge(
+            SessionPreferences(
+                session_id=session_id, preferences=preferences, updated_at=now
+            )
         )
         await db.commit()
 
@@ -470,18 +391,13 @@ async def save_session_preferences_data(
 @router.get("", response_model=List[SessionResponse])
 async def list_sessions():
     """List all sessions with metadata."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-
-        cursor = await db.execute(
-            _session_summary_query() + """
-            GROUP BY s.id
-            ORDER BY s.updated_at DESC
-            """
-        )
-
-        rows = await cursor.fetchall()
-        return [dict(row) for row in rows]
+    async with db_session() as db:
+        rows = (
+            await db.execute(
+                _session_summary_stmt().order_by(ChatSession.updated_at.desc())
+            )
+        ).all()
+        return [dict(row._mapping) for row in rows]
 
 
 @router.post("", response_model=SessionResponse)
@@ -493,48 +409,39 @@ async def create_session(body: SessionCreate):
 @router.get("/{session_id}", response_model=SessionDetail)
 async def get_session(session_id: str):
     """Get session details with full message history."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
+    session_summary = await get_session_summary(session_id)
+    if not session_summary:
+        raise HTTPException(status_code=404, detail="Session not found")
 
-        session_summary = await get_session_summary(session_id)
-        if not session_summary:
-            raise HTTPException(status_code=404, detail="Session not found")
+    async with db_session() as db:
+        message_rows = (
+            await db.execute(
+                select(ChatMessage)
+                .where(ChatMessage.session_id == session_id)
+                .order_by(ChatMessage.id.asc())
+            )
+        ).scalars().all()
 
-        # Get messages
-        cursor = await db.execute(
-            """
-            SELECT id, role, content, timestamp, metadata
-            FROM messages
-            WHERE session_id = ?
-            ORDER BY id ASC
-            """,
-            (session_id,),
+    messages = [
+        Message(
+            id=m.id,
+            role=m.role,
+            content=m.content,
+            timestamp=m.timestamp,
+            metadata=m.meta,
         )
-        message_rows = await cursor.fetchall()
+        for m in message_rows
+    ]
 
-        messages = []
-        for row in message_rows:
-            row_dict = dict(row)
-            # Parse metadata JSON if present
-            raw_meta = row_dict.pop("metadata", None)
-            if raw_meta and isinstance(raw_meta, str):
-                try:
-                    row_dict["metadata"] = json.loads(raw_meta)
-                except json.JSONDecodeError:
-                    row_dict["metadata"] = None
-            else:
-                row_dict["metadata"] = None
-            messages.append(Message(**row_dict))
-
-        return SessionDetail(
-            id=session_summary["id"],
-            title=session_summary["title"],
-            created_at=session_summary["created_at"],
-            updated_at=session_summary["updated_at"],
-            message_count=session_summary["message_count"],
-            last_message_preview=session_summary["last_message_preview"],
-            messages=messages,
-        )
+    return SessionDetail(
+        id=session_summary["id"],
+        title=session_summary["title"],
+        created_at=session_summary["created_at"],
+        updated_at=session_summary["updated_at"],
+        message_count=session_summary["message_count"],
+        last_message_preview=session_summary["last_message_preview"],
+        messages=messages,
+    )
 
 
 @router.get("/{session_id}/model-config", response_model=SessionModelConfigResponse)
@@ -557,44 +464,32 @@ async def update_session(session_id: str, body: SessionUpdate):
     """Update session metadata (title, timestamps, etc.)."""
     now = body.updatedAt or int(datetime.now().timestamp() * 1000)
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        # Build SET clause dynamically based on provided fields
-        updates = ["updated_at = ?"]
-        params: list = [now]
-
+    async with db_session() as db:
+        session = await db.get(ChatSession, session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Session not found")
         if body.title is not None:
-            updates.append("title = ?")
-            params.append(body.title)
-
-        params.append(session_id)
-
-        cursor = await db.execute(
-            f"UPDATE sessions SET {', '.join(updates)} WHERE id = ?",
-            params,
-        )
+            session.title = body.title
+        session.updated_at = now
         await db.commit()
 
-        if cursor.rowcount == 0:
-            raise HTTPException(status_code=404, detail="Session not found")
-
-        row = await get_session_summary(session_id)
-        if row is None:
-            raise HTTPException(status_code=404, detail="Session not found")
-        return row
+    row = await get_session_summary(session_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return row
 
 
 @router.delete("/{session_id}")
 async def delete_session(session_id: str):
     """Delete a session and all its messages."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "DELETE FROM sessions WHERE id = ?",
-            (session_id,),
+    async with db_session() as db:
+        result = await db.execute(
+            delete(ChatSession).where(ChatSession.id == session_id)
         )
         await db.commit()
 
-        if cursor.rowcount == 0:
-            raise HTTPException(status_code=404, detail="Session not found")
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Session not found")
     _session_runtime_api_keys.pop(session_id, None)
 
     logger.info(f"Deleted session {session_id}")

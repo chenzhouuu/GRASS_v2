@@ -63,14 +63,26 @@ export function submitPlanDecision(params: {
 
 // ─── Internal stream reader ─────────────────────────────────────────────────
 
+/** How many times a dropped stream is re-attached before giving up. */
+const MAX_RECONNECT_ATTEMPTS = 3;
+
 async function readStream(
   runId: string,
   assistantMessageId: string,
   signal: AbortSignal,
+  attempt = 0,
 ) {
+  // On a re-attach to the SAME run, resume from the stored cursor so the
+  // backlog is not replayed into an already-populated view.
+  const headers: Record<string, string> = {};
+  const { lastEventId, lastEventRunId } = useChatStore.getState();
+  if (attempt > 0 && lastEventRunId === runId && lastEventId) {
+    headers["Last-Event-ID"] = lastEventId;
+  }
+
   let res: Response;
   try {
-    res = await fetch(apiUrl(`/api/stream/${runId}`), { signal });
+    res = await fetch(apiUrl(`/api/stream/${runId}`), { signal, headers });
   } catch (err: unknown) {
     if (signal.aborted) return;
     const msg = err instanceof Error ? err.message : "Unknown stream error";
@@ -78,7 +90,23 @@ async function readStream(
     useChatStore.getState().setStreaming(false);
     return;
   }
-  await consumeStream(res, assistantMessageId, signal);
+  const terminal = await consumeStream(res, assistantMessageId, signal, runId);
+
+  // The connection dropped mid-run (proxy timeout, network blip): the run is
+  // still going on the backend, so re-attach with the cursor.
+  if (!terminal && !signal.aborted) {
+    if (attempt < MAX_RECONNECT_ATTEMPTS) {
+      await new Promise((r) => setTimeout(r, 1000));
+      if (!signal.aborted) {
+        return readStream(runId, assistantMessageId, signal, attempt + 1);
+      }
+    } else {
+      useChatStore.getState().updateMessage(assistantMessageId, {
+        content: "Error: lost connection to the run stream. The run may still be executing — reload the session to see its result.",
+      });
+      finalizeStreamView();
+    }
+  }
 }
 
 async function resumeRun(
@@ -111,22 +139,50 @@ async function resumeRun(
     chat.setStreaming(false);
     return;
   }
-  await consumeStream(res, assistantMessageId, signal);
+  const terminal = await consumeStream(res, assistantMessageId, signal, runId);
+  if (!terminal && !signal.aborted) {
+    // The decision was submitted; the continuation publishes into the same
+    // broker, so a dropped decision-response stream re-attaches via the
+    // regular stream endpoint with the stored cursor.
+    await readStream(runId, assistantMessageId, signal, 1);
+  }
 }
 
-/** Pump an SSE Response body through the frame parser + dispatcher. */
+/** Close out the streaming view state (spinner, live pipeline). */
+function finalizeStreamView() {
+  useChatStore.getState().setStreaming(false);
+  // If the run paused at the plan gate, keep the pipeline alive for resume.
+  const paused = !!useChatStore.getState().pendingReview;
+  const pipeline = useAgentStore.getState().livePipeline;
+  if (pipeline && !paused) {
+    useAgentStore.getState().completePipeline();
+  }
+}
+
+/** Terminal events: after one of these the stream is complete, not dropped. */
+const TERMINAL_EVENTS = new Set(["done", "plan_pending"]);
+
+/**
+ * Pump an SSE Response body through the frame parser + dispatcher.
+ *
+ * Returns true when the stream reached a terminal event (or a non-retryable
+ * failure that was surfaced to the user), false when the connection dropped
+ * mid-run — the caller may then re-attach with the stored cursor.
+ */
 async function consumeStream(
   res: Response,
   assistantMessageId: string,
   signal: AbortSignal,
-) {
+  runId?: string,
+): Promise<boolean> {
+  let sawTerminal = false;
   try {
     if (!res.ok || !res.body) {
       useChatStore.getState().updateMessage(assistantMessageId, {
         content: `Error: Stream connection failed (${res.status})`,
       });
       useChatStore.getState().setStreaming(false);
-      return;
+      return true;
     }
 
     const reader = res.body.getReader();
@@ -134,7 +190,7 @@ async function consumeStream(
     let buffer = "";
 
     while (true) {
-      if (signal.aborted) return;
+      if (signal.aborted) break;
 
       const { done, value } = await reader.read();
       if (done) break;
@@ -159,30 +215,40 @@ async function consumeStream(
         const parsed = parseSSEFrame(frame);
         if (!parsed) continue;
 
+        if (parsed.id && runId) {
+          useChatStore.getState().setLastEvent(runId, parsed.id);
+        }
+        if (TERMINAL_EVENTS.has(parsed.event)) {
+          sawTerminal = true;
+        }
         dispatch(parsed.event, parsed.data, assistantMessageId);
       }
+      if (sawTerminal) break;
     }
   } catch (err: unknown) {
-    if (signal.aborted) return;
-    const msg = err instanceof Error ? err.message : "Unknown stream error";
-    useChatStore.getState().updateMessage(assistantMessageId, {
-      content: `Error: ${msg}`,
-    });
-  } finally {
-    useChatStore.getState().setStreaming(false);
-    // If the run paused at the plan gate, keep the pipeline alive for resume.
-    const paused = !!useChatStore.getState().pendingReview;
-    const pipeline = useAgentStore.getState().livePipeline;
-    if (pipeline && !paused) {
-      useAgentStore.getState().completePipeline();
+    if (!signal.aborted) {
+      // Connection error mid-stream: report "dropped" so the caller can
+      // re-attach — the backend run is unaffected.
+      return false;
     }
   }
+
+  if (sawTerminal || signal.aborted) {
+    // Aborting means "stop watching", never "stop the run"; the view state
+    // is closed out here, the run continues server-side.
+    finalizeStreamView();
+    return true;
+  }
+  return false;
 }
 
 // ─── SSE frame parser ───────────────────────────────────────────────────────
 
-function parseSSEFrame(frame: string): { event: string; data: unknown } | null {
+function parseSSEFrame(
+  frame: string,
+): { event: string; data: unknown; id: string | null } | null {
   let event = "message";
+  let id: string | null = null;
   const dataLines: string[] = [];
 
   for (const line of frame.split("\n")) {
@@ -190,6 +256,8 @@ function parseSSEFrame(frame: string): { event: string; data: unknown } | null {
       event = line.slice(6).trim();
     } else if (line.startsWith("data:")) {
       dataLines.push(line.slice(5).trim());
+    } else if (line.startsWith("id:")) {
+      id = line.slice(3).trim();
     }
   }
 
@@ -197,7 +265,7 @@ function parseSSEFrame(frame: string): { event: string; data: unknown } | null {
 
   try {
     const data = JSON.parse(dataLines.join("\n"));
-    return { event, data };
+    return { event, data, id };
   } catch (err) {
     console.warn(
       `[SSE] Failed to parse frame (event="${event}"):`,

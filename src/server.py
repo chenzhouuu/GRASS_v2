@@ -4,22 +4,25 @@ This is the integration layer between the Next.js frontend and the LangGraph bac
 It provides REST endpoints and SSE streaming for real-time agent progress updates.
 """
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-import aiosqlite
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from psycopg_pool import AsyncConnectionPool
 
 from .utils.neo4j_connection import (
     close_driver,
     get_neo4j_runtime_state,
     initialize_default_connection,
 )
-from .api import sessions, database, chat, files
+from .api import sessions, database, chat, files, dashboards
+from .db import dispose_engine, psycopg_url
+from .api.vendor.aegra_broker import active_runs, broker_manager
 from .utils.prompt_assembler import PromptAssembler
 from .utils.session_graph_registry import SessionGraphRegistry
 
@@ -39,31 +42,27 @@ app_state = {
 
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
-CHECKPOINT_DB_PATH = DATA_DIR / "langgraph_checkpoints.sqlite"
-
-
-class _CompatAioSqliteConnection:
-    """Compatibility shim for AsyncSqliteSaver + aiosqlite>=0.22."""
-
-    def __init__(self, conn: aiosqlite.Connection):
-        self._conn = conn
-
-    def is_alive(self) -> bool:
-        # Inside ``async with aiosqlite.connect(...)`` the connection is active.
-        return True
-
-    def __await__(self):
-        return self._conn.__await__()
-
-    def __getattr__(self, name: str):
-        return getattr(self._conn, name)
 
 
 @asynccontextmanager
-async def open_sqlite_checkpointer(db_path: Path):
-    """Open a LangGraph SQLite checkpointer with local compatibility fixes."""
-    async with aiosqlite.connect(db_path) as conn:
-        yield AsyncSqliteSaver(_CompatAioSqliteConnection(conn))
+async def open_postgres_checkpointer():
+    """Open the LangGraph Postgres checkpointer (checkpoint* tables in the
+    shared grass database; ``setup()`` creates them and runs migrations)."""
+    pool = AsyncConnectionPool(
+        psycopg_url(),
+        max_size=10,
+        open=False,
+        # Required by AsyncPostgresSaver: autocommit for setup/migrations,
+        # no prepared statements (it drives connections in pipeline mode).
+        kwargs={"autocommit": True, "prepare_threshold": 0},
+    )
+    await pool.open()
+    try:
+        checkpointer = AsyncPostgresSaver(pool)
+        await checkpointer.setup()
+        yield checkpointer
+    finally:
+        await pool.close()
 
 
 @asynccontextmanager
@@ -74,6 +73,10 @@ async def lifespan(app: FastAPI):
     # Initialize sessions database
     await sessions.init_db()
 
+    # Reconcile runs left non-terminal by the previous process life and
+    # drop run events past their retention window.
+    await chat.startup_run_recovery()
+
     # Initialize Neo4j connection from env defaults. Do not crash startup if the
     # default config is unavailable; the frontend can apply a runtime override.
     app_state["neo4j_connected"] = initialize_default_connection()
@@ -82,7 +85,7 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("Neo4j unavailable at startup; waiting for runtime config override")
 
-    async with open_sqlite_checkpointer(CHECKPOINT_DB_PATH) as checkpointer:
+    async with open_postgres_checkpointer() as checkpointer:
         app_state["checkpointer"] = checkpointer
 
         try:
@@ -96,22 +99,40 @@ async def lifespan(app: FastAPI):
             chat.set_graph_factory(graph_registry.get_graph)
 
             logger.info(
-                "Session-aware LangGraph registry ready (sqlite checkpoints)"
+                "Session-aware LangGraph registry ready (postgres checkpoints)"
             )
         except Exception as e:
             logger.error(f"Failed to initialize graph registry: {e}")
             raise
 
+        # Broker retention: finished run brokers are swept by this task
+        # (1 hour after terminal status, upstream default).
+        await broker_manager.start()
+
         logger.info("GRASS server ready")
 
         yield
 
+        # Drain in-flight runs BEFORE the checkpointer closes under them —
+        # a run outliving its storage writes "closed connection" errors
+        # into session history as the assistant reply. Cancellation takes
+        # each run through its persist-partial path while storage is open.
+        if active_runs:
+            logger.info("Cancelling %d in-flight run(s)...", len(active_runs))
+            for task in list(active_runs.values()):
+                task.cancel()
+            await asyncio.gather(
+                *list(active_runs.values()), return_exceptions=True
+            )
+
     # Shutdown
     logger.info("Shutting down GRASS server...")
+    await broker_manager.stop()
     app_state["checkpointer"] = None
     app_state["graph_factory"] = None
     close_driver()
     logger.info("Neo4j connection closed")
+    await dispose_engine()
 
 
 # Create FastAPI app
@@ -194,6 +215,7 @@ app.include_router(chat.router)
 app.include_router(sessions.router)
 app.include_router(database.router)
 app.include_router(files.router)
+app.include_router(dashboards.router)
 
 
 if __name__ == "__main__":

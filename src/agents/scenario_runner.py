@@ -24,7 +24,11 @@ from typing import Any
 from langchain_core.messages import AIMessage
 
 from ..core.schemas import OptimizationRun, Perturbation, Scenario
-from ..tools.python_executor import execute_python, persist_cypher_results
+from ..tools.python_executor import (
+    execute_python,
+    execution_session,
+    persist_optimization_input,
+)
 from ..tools.scenario_perturbation import apply_perturbations
 from .optimization_agent import (
     _build_sankey_from_solution,
@@ -185,8 +189,18 @@ class ScenarioRunner:
             solution = res["solution"]
             error = res["error"]
         else:
+            if not baseline.input_path:
+                return self._blocked(
+                    "The saved optimization baseline predates the current data "
+                    "layout (it does not record which input file its cached "
+                    "code reads), so a re-solve would silently run on "
+                    "unperturbed data. Run the optimization once more, then "
+                    "repeat the what-if.",
+                    state,
+                )
             solution, error = self._solve(
-                baseline.code, perturbed, state.get("session_id")
+                baseline.code, perturbed, state.get("session_id"),
+                input_path=baseline.input_path,
             )
 
         # 2b. Infeasible scenario → quantify (unserved demand + minimum capacity
@@ -417,15 +431,21 @@ class ScenarioRunner:
         }
 
     def _solve(
-        self, code: str, rows: list[dict], session_id: str | None = None
+        self,
+        code: str,
+        rows: list[dict],
+        session_id: str | None = None,
+        input_path: str | None = None,
     ) -> tuple[dict | None, str | None]:
         """Run cached solver code against ``rows``; return (solution, error).
 
-        The rows must go to the session's data file — the cached code has
-        that path baked in from codegen time.
+        The rows must go to the exact input file the cached code reads —
+        that path was baked in at codegen time and is recorded in the
+        baseline's ``input_path``.
         """
-        persist_cypher_results(rows, session_id)
-        exec_result = execute_python.invoke({"code": code})
+        persist_optimization_input(rows, session_id, rel_path=input_path)
+        with execution_session(session_id):
+            exec_result = execute_python.invoke({"code": code})
         output = exec_result.get("output") or ""
         error = exec_result.get("error")
         solution = _extract_solution_json(output) if not error else None
@@ -446,6 +466,13 @@ class ScenarioRunner:
 
         if not baseline.code:
             return self._blocked("The baseline has no cached code to sweep.", state)
+        if not baseline.input_path:
+            return self._blocked(
+                "The saved optimization baseline predates the current data "
+                "layout and cannot be swept safely. Run the optimization once "
+                "more, then repeat the sweep.",
+                state,
+            )
         if not factors:
             return self._blocked("No sweep factors were provided.", state)
 
@@ -459,14 +486,20 @@ class ScenarioRunner:
                     baseline.input_data,
                     [Perturbation(kind="scale_param", target=target, factor=float(f["low"]), selector=selector)],
                 )
-                sol, err = self._solve(baseline.code, rows, state.get("session_id"))
+                sol, err = self._solve(
+                    baseline.code, rows, state.get("session_id"),
+                    input_path=baseline.input_path,
+                )
                 low_obj = sol.get("objective") if (sol and not err) else None
             if f.get("high") is not None:
                 rows, _ = apply_perturbations(
                     baseline.input_data,
                     [Perturbation(kind="scale_param", target=target, factor=float(f["high"]), selector=selector)],
                 )
-                sol, err = self._solve(baseline.code, rows, state.get("session_id"))
+                sol, err = self._solve(
+                    baseline.code, rows, state.get("session_id"),
+                    input_path=baseline.input_path,
+                )
                 high_obj = sol.get("objective") if (sol and not err) else None
             results.append({"factor": f.get("name", target), "low_obj": low_obj, "high_obj": high_obj})
 

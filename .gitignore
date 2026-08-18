@@ -13,3 +13,5 @@ frontend/.next/
 frontend/node_modules/
 *.dump
 .DS_Store
+.mcp.json
+frontend/.claude/

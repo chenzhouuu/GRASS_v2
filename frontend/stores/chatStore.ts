@@ -14,6 +14,7 @@ interface ChatState {
   messages: Message[];
   addMessage: (message: Message) => void;
   updateMessage: (id: string, patch: Partial<Message>) => void;
+  removeMessage: (id: string) => void;
   clearMessages: () => void;
 
   // ── Streaming ───────────────────────────────────────────────────────────
@@ -23,6 +24,11 @@ interface ChatState {
   agentProgress: AgentStatus[];
 
   setStreaming: (streaming: boolean, runId?: string | null) => void;
+  // Event-id cursor of the run being watched — sent as Last-Event-ID when
+  // re-attaching to the same run after a dropped connection.
+  lastEventId: string | null;
+  lastEventRunId: string | null;
+  setLastEvent: (runId: string, eventId: string) => void;
   setStreamingAgent: (agent: AgentName | null, status?: AgentStatusValue) => void;
   updateAgentStatus: (agent: AgentName, status: AgentStatusValue, extra?: Partial<AgentStatus>) => void;
   resetAgentProgress: () => void;
@@ -56,6 +62,8 @@ export const useChatStore = create<ChatState>((set) => ({
     set((s) => ({
       messages: s.messages.map((m) => (m.id === id ? { ...m, ...patch } : m)),
     })),
+  removeMessage: (id) =>
+    set((s) => ({ messages: s.messages.filter((m) => m.id !== id) })),
   clearMessages: () => set({ messages: [] }),
 
   // Streaming
@@ -66,6 +74,10 @@ export const useChatStore = create<ChatState>((set) => ({
 
   setStreaming: (streaming, runId = null) =>
     set({ isStreaming: streaming, currentRunId: runId }),
+  lastEventId: null,
+  lastEventRunId: null,
+  setLastEvent: (runId, eventId) =>
+    set({ lastEventRunId: runId, lastEventId: eventId }),
   setStreamingAgent: (agent, status = "running") =>
     set((s) => {
       if (!agent) return { currentAgent: null };

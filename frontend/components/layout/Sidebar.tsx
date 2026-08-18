@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import {
   useState,
   useCallback,
@@ -18,6 +19,7 @@ import {
   Check,
   Settings,
   PanelLeftClose,
+  LayoutDashboard,
 } from "lucide-react";
 import { useSessions } from "@/hooks/useSessions";
 import { useAppStore } from "@/stores/appStore";
@@ -389,7 +391,7 @@ export function Sidebar() {
         )}
       </div>
 
-      {/* Footer: New session + Settings */}
+      {/* Footer: New session + Dashboards + Settings */}
       <div className="shrink-0 border-t border-sidebar-hover p-3 space-y-2">
         <button
           onClick={createSession}
@@ -398,6 +400,13 @@ export function Sidebar() {
           <Plus className="h-4 w-4" />
           New Session
         </button>
+        <Link
+          href="/dashboards"
+          className="flex w-full items-center gap-2 rounded-md px-3 py-1.5 text-sm text-sidebar-text hover:bg-sidebar-hover transition-colors"
+        >
+          <LayoutDashboard className="h-4 w-4" />
+          Dashboards
+        </Link>
         <button
           onClick={() => openSettings(true)}
           className="flex w-full items-center gap-2 rounded-md px-3 py-1.5 text-sm text-sidebar-text hover:bg-sidebar-hover transition-colors"

@@ -151,9 +151,16 @@ function RelationshipItem({
           <span className="h-2.5 w-2.5 shrink-0" />
         )}
         <Link2 className="h-3 w-3 shrink-0 text-amber-400" />
-        <span className="truncate font-medium">{rel.type}</span>
+        <span className="min-w-0 flex-1 truncate">
+          <span className="font-medium">{rel.type}</span>
+          {rel.pattern && (
+            <span className="ml-1 text-[10px] font-normal text-muted-foreground/60">
+              {rel.pattern}
+            </span>
+          )}
+        </span>
         {rel.properties.length > 0 && (
-          <span className="ml-auto text-[10px] text-muted-foreground/60">
+          <span className="text-[10px] text-muted-foreground/60">
             {rel.properties.length}
           </span>
         )}

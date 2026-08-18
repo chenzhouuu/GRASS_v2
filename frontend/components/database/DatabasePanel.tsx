@@ -2,7 +2,7 @@
 
 import { Group, Panel, Separator } from "react-resizable-panels";
 import { CypherEditor } from "./CypherEditor";
-import { ResultsTable } from "./ResultsTable";
+import { ResultsPanel } from "./ResultsPanel";
 import { SchemaExplorer } from "./SchemaExplorer";
 
 function ResizeHandle() {
@@ -15,9 +15,9 @@ function ResizeHandle() {
 
 export function DatabasePanel() {
   return (
-    <Group orientation="vertical" className="h-full min-h-0">
+    <Group orientation="vertical" className="h-full min-h-0" data-tour="database-panel">
       {/* Schema explorer — top, collapsible */}
-      <Panel defaultSize={30} minSize={10} collapsible collapsedSize={0}>
+      <Panel defaultSize={24} minSize={10} collapsible collapsedSize={0}>
         <div className="h-full min-h-0 overflow-hidden rounded-md border">
           <SchemaExplorer />
         </div>
@@ -26,7 +26,7 @@ export function DatabasePanel() {
       <ResizeHandle />
 
       {/* Cypher editor — middle */}
-      <Panel defaultSize={30} minSize={15}>
+      <Panel defaultSize={26} minSize={15}>
         <div className="h-full min-h-0 overflow-hidden rounded-md border">
           <CypherEditor />
         </div>
@@ -35,9 +35,9 @@ export function DatabasePanel() {
       <ResizeHandle />
 
       {/* Results table — bottom */}
-      <Panel defaultSize={40} minSize={15}>
+      <Panel defaultSize={50} minSize={20}>
         <div className="h-full min-h-0 overflow-hidden rounded-md border">
-          <ResultsTable />
+          <ResultsPanel />
         </div>
       </Panel>
     </Group>

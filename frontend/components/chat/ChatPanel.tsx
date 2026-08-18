@@ -1,17 +1,17 @@
 "use client";
 
-import { useCallback, useRef, useEffect } from "react";
+import { useCallback, useEffect } from "react";
 import { Circle, Menu } from "lucide-react";
 import { MessageList } from "./MessageList";
 import { ChatInput } from "./ChatInput";
 import { WelcomePage } from "./WelcomePage";
 import { sendChatMessage } from "@/lib/api";
+import { stopRunWatch } from "@/lib/runWatch";
 import { useAppStore } from "@/stores/appStore";
 import { useChatStore } from "@/stores/chatStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 
 export function ChatPanel() {
-  const disconnectRef = useRef<(() => void) | null>(null);
   const currentSessionId = useAppStore((s) => s.currentSessionId);
   const sessions = useAppStore((s) => s.sessions);
   const neo4jConnected = useAppStore((s) => s.neo4jConnected);
@@ -25,18 +25,17 @@ export function ChatPanel() {
 
   useEffect(() => {
     return () => {
-      disconnectRef.current?.();
-      disconnectRef.current = null;
+      // Unmounting means "stop WATCHING", deliberately not "stop the run":
+      // the backend owns the run and finishes + persists it regardless.
+      // Stopping a run is only ever the explicit Stop button (stopActiveRun).
+      stopRunWatch();
     };
   }, []);
 
   const handleSend = useCallback(async (content: string) => {
-    disconnectRef.current?.();
-    disconnectRef.current = null;
-    const disconnect = await sendChatMessage(content, currentSessionId ?? undefined);
-    if (disconnect) {
-      disconnectRef.current = disconnect;
-    }
+    // sendChatMessage registers the new watch itself (closing the previous
+    // one) — closing a watch never cancels the run it was observing.
+    await sendChatMessage(content, currentSessionId ?? undefined);
   }, [currentSessionId]);
 
   // ── Welcome page (no messages yet) ─────────────────────────────────────────

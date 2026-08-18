@@ -256,7 +256,7 @@ When problem_type is "facility_location":
 - When data has monthly_production_gal (gallons), convert to lbs: multiply by 8.6 (1 gal milk ≈ 8.6 lbs).
 
 ## Handling Combined Datasets from Multiple Cypher Steps
-The data file (cypher_results.json) may contain rows from MULTIPLE Cypher queries
+The data file ({data_path}) may contain rows from MULTIPLE Cypher queries
 concatenated together. Each row has a `_query_step` field indicating which query produced it.
 
 Split the data using `_query_step`:
@@ -332,3 +332,5 @@ Do NOT use fig.show(). Do NOT save chart files. The JSON IS the output.
 
 ## Available libraries
 pulp, pandas, numpy, math, json, shutil, plotly
+The script runs in an offline sandbox — no network access, `pip install`
+will fail. Use only the libraries above.
